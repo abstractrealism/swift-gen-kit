@@ -6,7 +6,7 @@ public class ChatSession {
 
     public func stream(_ request: ChatSessionRequest, runLoopLimit: Int = 10, maxConcurrentToolCalls: Int = 3) -> AsyncThrowingStream<Message, Error> {
         AsyncThrowingStream { continuation in
-            Task {
+            let task = Task {
                 do {
                     let runID = String.id
                     var messages = request.messages
@@ -14,6 +14,7 @@ public class ChatSession {
                     var runShouldContinue = true
 
                     while runShouldContinue {
+                        try Task.checkCancellation()
                         guard runLoopCount < runLoopLimit else {
                             continuation.finish(throwing: ChatSessionError.maxRunLoopLimit)
                             return
@@ -56,6 +57,13 @@ public class ChatSession {
                 } catch {
                     continuation.finish(throwing: error)
                 }
+            }
+            // The work above runs in an unstructured task, so cancelling the
+            // consumer does not reach it. Without this the run loop keeps
+            // going after the consumer has stopped listening: the service
+            // request stays open, and any pending tool-call round still fires.
+            continuation.onTermination = { _ in
+                task.cancel()
             }
         }
     }
