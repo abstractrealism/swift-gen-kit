@@ -1,5 +1,6 @@
 import Foundation
 import OSLog
+import SharedKit
 import Ollama
 
 private let logger = Logger(subsystem: "OllamaService", category: "GenKit")
@@ -22,7 +23,8 @@ extension OllamaService: ChatService {
             model: request.model.id,
             messages: encode(messages: request.messages),
             tools: encode(request.tools),
-            stream: false
+            stream: false,
+            think: thinking(from: request.options)
         )
         let resp = try await client.chatCompletions(req)
         return decode(resp)
@@ -33,7 +35,8 @@ extension OllamaService: ChatService {
             model: request.model.id,
             messages: encode(messages: request.messages),
             tools: encode(request.tools),
-            stream: true
+            stream: true,
+            think: thinking(from: request.options)
         )
         var message = Message(role: .assistant)
         for try await resp in try client.chatCompletionsStream(req) {
@@ -152,7 +155,10 @@ extension OllamaService {
     private func decode(_ resp: Ollama.ChatResponse) -> Message {
         Message(
             role: decode(resp.message?.role) ?? .assistant,
-            content: resp.message?.content,
+            content: compose(
+                thinking: resp.message?.thinking ?? "",
+                answer: resp.message?.content ?? ""
+            ),
             toolCalls: resp.message?.tool_calls?.map { decode($0) },
             finishReason: decode(resp.done)
         )
@@ -196,10 +202,44 @@ extension OllamaService {
         )
     }
 
+    /// Only ever returns false or nil. A model that can't reason rejects a
+    /// request that asks it to ("<model> does not support thinking"), so the
+    /// flag is sent only to turn reasoning off; leaving it out lets each model
+    /// keep its own default.
+    private func thinking(from options: [String: Value]) -> Bool? {
+        guard case .bool(false) = options["think"] else { return nil }
+        return false
+    }
+
+    /// Folds reasoning into the content as a `<think>` block.
+    ///
+    /// Ollama returns reasoning in its own field, but plenty of models inline
+    /// the tag in the answer instead, and readers already have to handle that.
+    /// Emitting one shape means a caller doesn't need to know which kind of
+    /// model produced the reply. The block is left open until the answer
+    /// starts, so a reader streaming the reply can tell reasoning from answer
+    /// as it arrives.
+    private func compose(thinking: String, answer: String) -> String {
+        guard !thinking.isEmpty else { return answer }
+        let closing = answer.isEmpty ? "" : "\n</think>\n"
+        return "<think>\n" + thinking + closing + answer
+    }
+
     private func patchMessage(_ message: inout Message, with resp: Ollama.ChatResponse) {
 
+        // Reasoning and answer stream as separate deltas, so accumulate each
+        // and rebuild the combined content from both every time.
+        if resp.message?.thinking != nil || message.metadata["thinking"] != nil {
+            let thinking = (message.metadata["thinking"]?.stringValue ?? "") + (resp.message?.thinking ?? "")
+            let answer = (message.metadata["answer"]?.stringValue ?? "") + (resp.message?.content ?? "")
+
+            message.metadata["thinking"] = .string(thinking)
+            message.metadata["answer"] = .string(answer)
+            message.contents = [.text(compose(thinking: thinking, answer: answer))]
+        }
+
         // Patch message content
-        if case .text(let text) = message.contents?.last {
+        else if case .text(let text) = message.contents?.last {
             if let patched = GenKit.patch(string: text, with: resp.message?.content) {
                 message.contents = [.text(patched)]
             }
