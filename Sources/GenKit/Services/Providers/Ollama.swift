@@ -1,5 +1,6 @@
 import Foundation
 import OSLog
+import SharedKit
 import Ollama
 
 private let logger = Logger(subsystem: "OllamaService", category: "GenKit")
@@ -154,7 +155,8 @@ extension OllamaService {
             role: decode(resp.message?.role) ?? .assistant,
             content: resp.message?.content,
             toolCalls: resp.message?.tool_calls?.map { decode($0) },
-            finishReason: decode(resp.done)
+            finishReason: decode(resp.done),
+            metadata: usage(from: resp)
         )
     }
 
@@ -196,6 +198,24 @@ extension OllamaService {
         )
     }
 
+    /// Ollama reports token counts and timings on the final chunk of a
+    /// response. Carry them on the message so a caller can show what a
+    /// generation cost, under provider-neutral names since other services
+    /// report the same things.
+    private func usage(from resp: Ollama.ChatResponse) -> [String: Value] {
+        var usage: [String: Value] = [:]
+        if let input = resp.prompt_eval_count {
+            usage["inputTokens"] = .int(input)
+        }
+        if let output = resp.eval_count {
+            usage["outputTokens"] = .int(output)
+        }
+        if let nanos = resp.eval_duration, nanos > 0 {
+            usage["outputSeconds"] = .double(Double(nanos) / 1_000_000_000)
+        }
+        return usage
+    }
+
     private func patchMessage(_ message: inout Message, with resp: Ollama.ChatResponse) {
 
         // Patch message content
@@ -215,6 +235,7 @@ extension OllamaService {
             message.toolCalls! += toolCalls.map { decode($0) }
         }
 
+        message.metadata.merge(usage(from: resp)) { _, new in new }
         message.finishReason = decode(resp.done)
         message.modified = .now
     }
