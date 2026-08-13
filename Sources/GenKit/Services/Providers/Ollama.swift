@@ -6,8 +6,19 @@ import Ollama
 private let logger = Logger(subsystem: "OllamaService", category: "GenKit")
 
 public actor OllamaService {
-    
+
     private let client: Ollama.Client
+
+    /// What each model supports, as the server reported it.
+    ///
+    /// Held for the life of the service: it costs one extra round trip the
+    /// first time a model is used, and the answer only changes if the model
+    /// itself is replaced, which means restarting the app anyway.
+    private var capabilitiesByModel: [String: Set<Capability>] = [:]
+
+    enum Capability: String {
+        case completion, tools, thinking, vision, insert
+    }
 
     public init(session: URLSession? = nil, host: URL? = nil) {
         self.client = .init(session: session, host: host)
@@ -19,25 +30,13 @@ public actor OllamaService {
 extension OllamaService: ChatService {
     
     public func completion(_ request: ChatServiceRequest) async throws -> Message {
-        let req = ChatRequest(
-            model: request.model.id,
-            messages: encode(messages: request.messages),
-            tools: encode(request.tools),
-            stream: false,
-            think: thinking(from: request.options)
-        )
+        let req = await makeChatRequest(request, stream: false)
         let resp = try await client.chatCompletions(req)
         return decode(resp)
     }
-    
+
     public func completionStream(_ request: ChatServiceRequest, update: (Message) async throws -> Void) async throws {
-        let req = ChatRequest(
-            model: request.model.id,
-            messages: encode(messages: request.messages),
-            tools: encode(request.tools),
-            stream: true,
-            think: thinking(from: request.options)
-        )
+        let req = await makeChatRequest(request, stream: true)
         var message = Message(role: .assistant)
         for try await resp in try client.chatCompletionsStream(req) {
             patchMessage(&message, with: resp)
@@ -65,6 +64,73 @@ extension OllamaService: ModelService {
     public func models() async throws -> [Model] {
         let resp = try await client.models()
         return resp.models.map { decode($0) }
+    }
+}
+
+// MARK: - Capabilities
+
+extension OllamaService {
+
+    /// Builds a chat request carrying only what this model can actually accept.
+    ///
+    /// Ollama treats an unsupported capability as a hard error rather than an
+    /// option to ignore: a request with tools attached fails outright against a
+    /// model that has none ("<model> does not support tools"), and so does
+    /// `think: true` without reasoning support. Since a conversation keeps its
+    /// tools and a service its reasoning setting, switching to a smaller model
+    /// used to break every send until those were found and changed by hand.
+    /// Asking the server what the model can do turns that into nothing.
+    private func makeChatRequest(_ request: ChatServiceRequest, stream: Bool) async -> ChatRequest {
+        let capabilities = await capabilities(for: request.model.id)
+
+        // No answer — an older server, or the lookup failed — means send what
+        // was asked for, exactly as before this check existed. Better to let a
+        // request fail the way it used to than to quietly strip tools from a
+        // model that would have handled them.
+        func supports(_ capability: Capability) -> Bool {
+            capabilities?.contains(capability) ?? true
+        }
+
+        var tools = encode(request.tools)
+        if !tools.isEmpty, !supports(.tools) {
+            logger.warning("\(request.model.id, privacy: .public) does not support tools; sending the request without \(tools.count, privacy: .public) of them")
+            tools = []
+        }
+
+        // `think: false` happens to be tolerated by models that can't reason,
+        // but there is nothing for it to switch off, so drop the flag rather
+        // than relying on that.
+        var think = thinking(from: request.options)
+        if think != nil, !supports(.thinking) {
+            think = nil
+        }
+
+        return ChatRequest(
+            model: request.model.id,
+            messages: encode(messages: request.messages),
+            // Omitted rather than sent empty. An empty array is accepted, but
+            // "no tools" is the absence of the key.
+            tools: tools.isEmpty ? nil : tools,
+            stream: stream,
+            think: think
+        )
+    }
+
+    /// What the server says this model supports, or nil when it won't say.
+    private func capabilities(for modelID: String) async -> Set<Capability>? {
+        if let known = capabilitiesByModel[modelID] {
+            return known
+        }
+        do {
+            let resp = try await client.model(.init(name: modelID))
+            guard let names = resp.capabilities else { return nil }
+            let known = Set(names.compactMap(Capability.init(rawValue:)))
+            capabilitiesByModel[modelID] = known
+            return known
+        } catch {
+            logger.warning("Could not read capabilities for \(modelID, privacy: .public): \(error, privacy: .public)")
+            return nil
+        }
     }
 }
 
