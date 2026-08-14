@@ -14,11 +14,7 @@ public actor OllamaService {
     /// Held for the life of the service: it costs one extra round trip the
     /// first time a model is used, and the answer only changes if the model
     /// itself is replaced, which means restarting the app anyway.
-    private var capabilitiesByModel: [String: Set<Capability>] = [:]
-
-    enum Capability: String {
-        case completion, tools, thinking, vision, insert
-    }
+    private var capabilitiesByModel: [String: Set<Model.Capability>] = [:]
 
     public init(session: URLSession? = nil, host: URL? = nil) {
         self.client = .init(session: session, host: host)
@@ -63,7 +59,18 @@ extension OllamaService: ModelService {
     
     public func models() async throws -> [Model] {
         let resp = try await client.models()
-        return resp.models.map { decode($0) }
+        var models = resp.models.map { decode($0) }
+
+        // Capabilities come from a separate endpoint, one call per model.
+        // Worth doing here rather than on demand: it reads metadata only —
+        // verified against a live server, nothing is loaded into memory and a
+        // call returns in about a tenth of a second — so carrying the answers
+        // on the models means the app can ask what one supports without a
+        // round trip, and without waiting for a first request to find out.
+        for index in models.indices {
+            models[index].capabilities = await capabilities(for: models[index].id)
+        }
+        return models
     }
 }
 
@@ -87,7 +94,7 @@ extension OllamaService {
         // was asked for, exactly as before this check existed. Better to let a
         // request fail the way it used to than to quietly strip tools from a
         // model that would have handled them.
-        func supports(_ capability: Capability) -> Bool {
+        func supports(_ capability: Model.Capability) -> Bool {
             capabilities?.contains(capability) ?? true
         }
 
@@ -117,14 +124,14 @@ extension OllamaService {
     }
 
     /// What the server says this model supports, or nil when it won't say.
-    private func capabilities(for modelID: String) async -> Set<Capability>? {
+    private func capabilities(for modelID: String) async -> Set<Model.Capability>? {
         if let known = capabilitiesByModel[modelID] {
             return known
         }
         do {
             let resp = try await client.model(.init(name: modelID))
             guard let names = resp.capabilities else { return nil }
-            let known = Set(names.compactMap(Capability.init(rawValue:)))
+            let known = Set(names.compactMap(Model.Capability.init(rawValue:)))
             capabilitiesByModel[modelID] = known
             return known
         } catch {
