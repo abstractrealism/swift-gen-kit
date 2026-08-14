@@ -321,6 +321,14 @@ extension OllamaService {
     /// report the same things.
     private func usage(from resp: Ollama.ChatResponse) -> [String: Value] {
         var usage: [String: Value] = [:]
+
+        // Which model actually answered, reported on every chunk. Recorded
+        // per message because the answer can change within one conversation —
+        // the model can be switched between messages, and a conversation
+        // whose model has since been removed falls back to another. Without
+        // this there is nothing anywhere saying what wrote a given reply.
+        usage["model"] = .string(resp.model)
+
         if let input = resp.prompt_eval_count {
             usage["inputTokens"] = .int(input)
         }
