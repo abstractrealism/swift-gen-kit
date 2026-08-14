@@ -63,12 +63,28 @@ extension OllamaService: ModelService {
 
         // Capabilities come from a separate endpoint, one call per model.
         // Worth doing here rather than on demand: it reads metadata only —
-        // verified against a live server, nothing is loaded into memory and a
-        // call returns in about a tenth of a second — so carrying the answers
-        // on the models means the app can ask what one supports without a
-        // round trip, and without waiting for a first request to find out.
+        // against a local server nothing is loaded into memory and a call
+        // returns in around 13ms — so carrying the answers on the models lets
+        // the app ask what one supports without a round trip at the point of
+        // use.
+        //
+        // Together rather than one after another. Locally the difference is
+        // nothing, but this is one round trip per model, and against a server
+        // reached over a phone connection or a VPN that becomes the whole
+        // cost: sequentially it grows with the number of models installed,
+        // concurrently it stays roughly the latency of one.
+        let found = await withTaskGroup(of: (String, Set<Model.Capability>?).self) { group in
+            for model in models {
+                group.addTask { (model.id, await self.capabilities(for: model.id)) }
+            }
+            var found: [String: Set<Model.Capability>?] = [:]
+            for await (id, capabilities) in group {
+                found[id] = capabilities
+            }
+            return found
+        }
         for index in models.indices {
-            models[index].capabilities = await capabilities(for: models[index].id)
+            models[index].capabilities = found[models[index].id] ?? nil
         }
         return models
     }
