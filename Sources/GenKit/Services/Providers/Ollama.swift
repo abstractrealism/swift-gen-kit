@@ -14,7 +14,15 @@ public actor OllamaService {
     /// Held for the life of the service: it costs one extra round trip the
     /// first time a model is used, and the answer only changes if the model
     /// itself is replaced, which means restarting the app anyway.
-    private var capabilitiesByModel: [String: Set<Model.Capability>] = [:]
+    private var detailsByModel: [String: ModelDetails] = [:]
+
+    /// What one `/api/show` call is worth keeping. Held together because they
+    /// arrive together — asking twice for two fields of the same response
+    /// would double the round trips this is trying to avoid.
+    struct ModelDetails: Sendable {
+        var capabilities: Set<Model.Capability>?
+        var contextLength: Int?
+    }
 
     public init(session: URLSession? = nil, host: URL? = nil) {
         self.client = .init(session: session, host: host)
@@ -73,18 +81,35 @@ extension OllamaService: ModelService {
         // reached over a phone connection or a VPN that becomes the whole
         // cost: sequentially it grows with the number of models installed,
         // concurrently it stays roughly the latency of one.
-        let found = await withTaskGroup(of: (String, Set<Model.Capability>?).self) { group in
+        let found = await withTaskGroup(of: (String, ModelDetails).self) { group in
             for model in models {
-                group.addTask { (model.id, await self.capabilities(for: model.id)) }
+                group.addTask { (model.id, await self.details(for: model.id)) }
             }
-            var found: [String: Set<Model.Capability>?] = [:]
-            for await (id, capabilities) in group {
-                found[id] = capabilities
+            var found: [String: ModelDetails] = [:]
+            for await (id, details) in group {
+                found[id] = details
             }
             return found
         }
+        // What a model was actually loaded with, which is not what it says it
+        // can do. A model built for 262,144 tokens is routinely loaded with a
+        // fraction of that, so reporting the built-in maximum would overstate
+        // the room available — by 8x on a model measured here. One call for
+        // every loaded model, and only models currently in memory appear.
+        let running = (try? await client.modelsRunning().models) ?? []
+        let loadedContext = Dictionary(
+            running.compactMap { model in model.context_length.map { (model.model, $0) } },
+            uniquingKeysWith: { first, _ in first }
+        )
+
         for index in models.indices {
-            models[index].capabilities = found[models[index].id] ?? nil
+            let id = models[index].id
+            guard let details = found[id] else { continue }
+            models[index].capabilities = details.capabilities
+            // The advertised maximum is the fallback, not the answer: a model
+            // that isn't loaded can't be asked, and an overstated limit beats
+            // no limit at all when the alternative is showing nothing.
+            models[index].contextWindow = loadedContext[id] ?? details.contextLength
         }
         return models
     }
@@ -141,18 +166,30 @@ extension OllamaService {
 
     /// What the server says this model supports, or nil when it won't say.
     private func capabilities(for modelID: String) async -> Set<Model.Capability>? {
-        if let known = capabilitiesByModel[modelID] {
+        await details(for: modelID).capabilities
+    }
+
+    /// What the server reports about a model, remembered per model.
+    ///
+    /// A failed lookup returns empty rather than throwing, and isn't cached:
+    /// nothing here is worth failing a request over, and a server that was
+    /// briefly unreachable should be asked again rather than remembered as
+    /// having said nothing.
+    private func details(for modelID: String) async -> ModelDetails {
+        if let known = detailsByModel[modelID] {
             return known
         }
         do {
             let resp = try await client.model(.init(name: modelID))
-            guard let names = resp.capabilities else { return nil }
-            let known = Set(names.compactMap(Model.Capability.init(rawValue:)))
-            capabilitiesByModel[modelID] = known
-            return known
+            let details = ModelDetails(
+                capabilities: resp.capabilities.map { Set($0.compactMap(Model.Capability.init(rawValue:))) },
+                contextLength: resp.contextLength
+            )
+            detailsByModel[modelID] = details
+            return details
         } catch {
-            logger.warning("Could not read capabilities for \(modelID, privacy: .public): \(error, privacy: .public)")
-            return nil
+            logger.warning("Could not read details for \(modelID, privacy: .public): \(error, privacy: .public)")
+            return ModelDetails()
         }
     }
 }
