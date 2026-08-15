@@ -1,6 +1,7 @@
 import Foundation
 import OSLog
 import SharedKit
+import JSONSchema
 import Ollama
 
 private let logger = Logger(subsystem: "OllamaService", category: "GenKit")
@@ -106,10 +107,13 @@ extension OllamaService: ModelService {
             let id = models[index].id
             guard let details = found[id] else { continue }
             models[index].capabilities = details.capabilities
-            // The advertised maximum is the fallback, not the answer: a model
-            // that isn't loaded can't be asked, and an overstated limit beats
-            // no limit at all when the alternative is showing nothing.
-            models[index].contextWindow = loadedContext[id] ?? details.contextLength
+            // Kept apart deliberately. The ceiling is what the model was built
+            // for and is what a caller offering to change the setting has to
+            // bound itself by; the loaded figure is what a request is measured
+            // against right now. Collapsing them into one number means
+            // whichever question you ask second gets the wrong answer.
+            models[index].contextWindow = details.contextLength
+            models[index].loadedContextWindow = loadedContext[id]
         }
         return models
     }
@@ -159,6 +163,7 @@ extension OllamaService {
             // Omitted rather than sent empty. An empty array is accepted, but
             // "no tools" is the absence of the key.
             tools: tools.isEmpty ? nil : tools,
+            options: runtimeOptions(from: request.options),
             stream: stream,
             think: think
         )
@@ -336,6 +341,27 @@ extension OllamaService {
     private func thinking(from options: [String: Value]) -> Bool? {
         guard case .bool(false) = options["think"] else { return nil }
         return false
+    }
+
+    /// Request options Ollama takes under `options`, which until now were
+    /// being dropped on the floor — a caller could ask for a context length
+    /// and nothing carried it as far as the request.
+    ///
+    /// Named individually rather than passed through wholesale. `think` is a
+    /// field of its own and would be meaningless here, and forwarding
+    /// everything else unseen would mean a typo in a key travelling all the
+    /// way to the server to be quietly ignored.
+    private func runtimeOptions(from options: [String: Value]) -> [String: JSONValue]? {
+        var runtime: [String: JSONValue] = [:]
+
+        // How much context to load the model with. Sent only when somebody
+        // asked: leaving it out is what lets the server apply its own default,
+        // and naming a different value from the one already loaded costs a
+        // reload.
+        if let contextLength = options["num_ctx"]?.intValue {
+            runtime["num_ctx"] = .int(contextLength)
+        }
+        return runtime.isEmpty ? nil : runtime
     }
 
     /// Folds reasoning into the content as a `<think>` block.
