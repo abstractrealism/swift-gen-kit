@@ -157,9 +157,25 @@ extension OllamaService {
             think = nil
         }
 
+        // A model without vision refuses the whole request rather than ignoring
+        // the pictures — "Multimodal data provided, but model does not support
+        // multimodal requests", HTTP 400. Since a conversation keeps the
+        // pictures it was sent, that turns one attachment into a thread that
+        // can never be answered again once its model is changed. Dropping them
+        // costs an answer about a picture; keeping them costs the conversation.
+        let canSeeImages = supports(.vision)
+        if !canSeeImages {
+            let count = request.messages.reduce(0) { total, message in
+                total + (message.contents?.filter { if case .image = $0 { true } else { false } }.count ?? 0)
+            }
+            if count > 0 {
+                logger.warning("\(request.model.id, privacy: .public) can't read images; sending without \(count, privacy: .public) of them")
+            }
+        }
+
         return ChatRequest(
             model: request.model.id,
-            messages: encode(messages: request.messages),
+            messages: encode(messages: request.messages, includingImages: canSeeImages),
             // Omitted rather than sent empty. An empty array is accepted, but
             // "no tools" is the absence of the key.
             tools: tools.isEmpty ? nil : tools,
@@ -203,12 +219,12 @@ extension OllamaService {
 
 extension OllamaService {
 
-    private func encode(messages: [Message]) -> [Ollama.Message] {
+    private func encode(messages: [Message], includingImages: Bool = true) -> [Ollama.Message] {
         messages.map { message in
             Ollama.Message(
                 role: encode(message.role),
                 content: encode(message.contents),
-                images: encode(message.contents)
+                images: includingImages ? encode(message.contents) : nil
             )
         }
     }
