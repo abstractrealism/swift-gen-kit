@@ -354,9 +354,28 @@ extension OllamaService {
     /// request that asks it to ("<model> does not support thinking"), so the
     /// flag is sent only to turn reasoning off; leaving it out lets each model
     /// keep its own default.
-    private func thinking(from options: [String: Value]) -> Bool? {
-        guard case .bool(false) = options["think"] else { return nil }
-        return false
+    /// What the caller asked for under `think`, as Ollama takes it.
+    ///
+    /// A string is a level — `low`, `medium`, `high`, `max` — and a bool is the
+    /// plain switch. Levels matter because some models accept nothing else:
+    /// GPT-OSS ignores `true`/`false` outright, so without one there is no way
+    /// to ask it for less reasoning, or for none.
+    ///
+    /// Anything unrecognised is dropped rather than guessed at. Nil means say
+    /// nothing, which leaves the model on its own default.
+    private func thinking(from options: [String: Value]) -> Think? {
+        switch options["think"] {
+        case .bool(let flag):
+            return .enabled(flag)
+        case .string(let raw):
+            guard let level = Think.Level(rawValue: raw) else {
+                logger.warning("ignoring unrecognised think level \(raw, privacy: .public)")
+                return nil
+            }
+            return .level(level)
+        default:
+            return nil
+        }
     }
 
     /// Request options Ollama takes under `options`, which until now were
