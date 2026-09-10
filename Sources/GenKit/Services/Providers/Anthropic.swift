@@ -283,11 +283,13 @@ extension AnthropicService {
             if let contentBlock = resp.content_block {
                 switch contentBlock.type {
                 case .thinking:
-                    // Opened and left open. A reader streaming the reply tells
-                    // reasoning from answer by the tag, and it's the answer
-                    // starting that closes it — see `closeThinking`. Same
-                    // shape the Ollama service composes.
-                    message.contents = [.text("<think>\n" + (contentBlock.thinking ?? ""))]
+                    // Deliberately nothing. Where thinking is on by default the
+                    // display is `omitted`, and an omitted block still opens
+                    // and closes — it just carries a signature and no
+                    // `thinking_delta` at all. Starting a `<think>` block here
+                    // would leave an empty one in every single answer. The
+                    // first delta with something in it starts it instead.
+                    break
                 case .text:
                     // Reasoning comes first and in its own block, so the
                     // answer beginning is where it ends. Appended rather than
@@ -320,9 +322,14 @@ extension AnthropicService {
             if let delta = resp.delta {
                 switch delta.type {
                 case .thinking_delta:
-                    if case .text(let existing) = message.contents?.last {
-                        let patched = GenKit.patch(string: existing, with: delta.thinking) ?? existing
-                        message.contents![message.contents!.count-1] = .text(patched)
+                    // Opened here, by the first reasoning to actually arrive,
+                    // and left open until the answer's block closes it.
+                    guard let thinking = delta.thinking, !thinking.isEmpty else { break }
+                    if case .text(let existing) = message.contents?.last,
+                       existing.hasPrefix("<think>"), !existing.contains("</think>") {
+                        message.contents![message.contents!.count-1] = .text(existing + thinking)
+                    } else {
+                        message.contents = (message.contents ?? []) + [.text("<think>\n" + thinking)]
                     }
                 case .text_delta:
                     if case .text(let existing) = message.contents?.last {
