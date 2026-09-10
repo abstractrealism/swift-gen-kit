@@ -151,6 +151,13 @@ public actor AnthropicService {
         static let assumed = Thinking(adaptive: true)
 
         static func supported(byModel id: String) -> Thinking {
+            known(byModel: id) ?? .assumed
+        }
+
+        /// What's actually recorded for a model, or nil where it isn't one
+        /// this knows. Distinct from `supported(byModel:)` so a caller can
+        /// tell a fact from an assumption.
+        static func known(byModel id: String) -> Thinking? {
             let table: [(String, Thinking)] = [
                 // Reason always, and reject being turned off.
                 ("claude-fable-5-1", .init(adaptive: true, canDisable: false)),
@@ -179,7 +186,7 @@ public actor AnthropicService {
             for (pattern, supported) in table where id.contains(pattern) {
                 return supported
             }
-            return .assumed
+            return nil
         }
 
         /// A thinking budget for a level, for the models that want one rather
@@ -193,6 +200,18 @@ public actor AnthropicService {
             default: 32768
             }
         }
+    }
+
+    /// Whether this model will accept being told not to reason.
+    ///
+    /// Nil where the model isn't one the table knows, which a caller should
+    /// read as "probably" rather than as a promise: the request degrades to
+    /// the least reasoning if the guess turns out wrong, so there's nothing to
+    /// warn anybody about in advance.
+    ///
+    /// `nonisolated` because it reads a table rather than the actor.
+    public nonisolated static func canDisableThinking(modelID: String) -> Bool? {
+        Thinking.known(byModel: modelID)?.canDisable
     }
 
     /// What the caller asked for, in this provider's terms.
