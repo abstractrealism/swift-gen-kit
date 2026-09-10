@@ -39,20 +39,66 @@ public actor AnthropicService {
         // than one: `thinking` decides whether the model reasons at all, and
         // `effort` how deeply — including how deeply it reasons when it does.
         //
-        // `summarized` because the default is `omitted`, under which the
-        // blocks still arrive carrying a signature and no text. A caller that
-        // means to show reasoning has to say so.
+        // What each model accepts differs, and it refuses what it doesn't
+        // rather than ignoring it, so this asks first. See `Thinking`.
+        let supported = Thinking.supported(byModel: model.id)
+
         switch effort(from: options) {
         case .none:
             break
+
         case .off:
-            req.thinking = .disabled
+            if supported.canDisable {
+                req.thinking = .disabled
+            } else {
+                // Some models reason on every request and reject being told
+                // not to. Asking for the least is as close as this gets, and
+                // closer than failing the send.
+                logger.info(
+                    "\(model.id, privacy: .public) always reasons; asking for the least rather than none"
+                )
+                apply(effort: "low", to: &req, supported: supported, model: model)
+            }
+
         case .level(let level):
-            req.thinking = .adaptive(display: "summarized")
-            req.output_config = .init(effort: level)
+            apply(effort: level, to: &req, supported: supported, model: model)
         }
 
         return req
+    }
+
+    /// Asks for reasoning at a level, in whichever of the two shapes this
+    /// model takes.
+    private func apply(
+        effort level: String,
+        to req: inout Anthropic.ChatRequest,
+        supported: Thinking,
+        model: Model
+    ) {
+        if supported.adaptive {
+            // `summarized` because the default is `omitted`, under which the
+            // blocks still arrive carrying a signature and no text. A caller
+            // that means to show reasoning has to say so.
+            req.thinking = .adaptive(display: "summarized")
+        } else if supported.extended {
+            // The older control: a token budget rather than a level. Its
+            // blocks come back with their text, so there's no display to ask
+            // for. Half the reply's ceiling at most, since that ceiling covers
+            // the reasoning and the answer together and an answer needs room.
+            let budget = min(Thinking.budget(for: level), max(1024, req.max_tokens / 2))
+            req.thinking = .init(type: "enabled", budget_tokens: budget)
+        } else {
+            logger.info(
+                "\(model.id, privacy: .public) takes no thinking setting; leaving it to the model"
+            )
+            return
+        }
+
+        // Not every model that reasons takes a level for it — the
+        // extended-thinking generation mostly doesn't.
+        if supported.effort {
+            req.output_config = .init(effort: level)
+        }
     }
 
     /// The temperature to send, if any.
@@ -69,6 +115,84 @@ public actor AnthropicService {
             "\(model.id, privacy: .public): dropping temperature \(temperature, privacy: .public) — models from Claude Sonnet 5 and Opus 4.7 onwards reject any non-default sampling value"
         )
         return nil
+    }
+
+    /// What a model will accept in the way of reasoning.
+    ///
+    /// There is no endpoint that says, and the API rejects what a model
+    /// doesn't take rather than ignoring it — `adaptive` to an
+    /// extended-thinking model is a 400, and so is `enabled` to an adaptive
+    /// one. So it's a table, and it will need adding to as models arrive.
+    ///
+    /// Matched on the id containing a pattern, since ids carry a date
+    /// (`claude-haiku-4-5-20251001`), and in order, because the more specific
+    /// pattern has to win: `claude-fable-5` is a prefix of
+    /// `claude-fable-5-1`.
+    struct Thinking {
+        /// Takes `thinking: {type: "adaptive"}` and decides for itself.
+        var adaptive = false
+
+        /// Takes `thinking: {type: "enabled", budget_tokens: n}`.
+        var extended = false
+
+        /// Takes `thinking: {type: "disabled"}`. False where a model reasons
+        /// on every request and refuses being told not to.
+        var canDisable = true
+
+        /// Takes `output_config.effort`.
+        var effort = true
+
+        /// Everything an unrecognised model is assumed to take.
+        ///
+        /// Adaptive, because every model from Claude Sonnet 4.6 onwards is,
+        /// and a model this doesn't know about is far likelier to be newer
+        /// than older. Wrong for an old model, and it says so out loud when
+        /// the request comes back refused.
+        static let assumed = Thinking(adaptive: true)
+
+        static func supported(byModel id: String) -> Thinking {
+            let table: [(String, Thinking)] = [
+                // Reason always, and reject being turned off.
+                ("claude-fable-5-1", .init(adaptive: true, canDisable: false)),
+                ("claude-mythos-5-1", .init(adaptive: true, canDisable: false)),
+                ("claude-fable-5", .init(adaptive: true, canDisable: false)),
+                ("claude-mythos-preview", .init(adaptive: true, extended: true, canDisable: false)),
+                ("claude-mythos-5", .init(adaptive: true, canDisable: false)),
+
+                // Adaptive only.
+                ("claude-opus-5", .init(adaptive: true)),
+                ("claude-opus-4-8", .init(adaptive: true)),
+                ("claude-opus-4-7", .init(adaptive: true)),
+                ("claude-sonnet-5", .init(adaptive: true)),
+
+                // Both, while the older one is still accepted.
+                ("claude-opus-4-6", .init(adaptive: true, extended: true)),
+                ("claude-sonnet-4-6", .init(adaptive: true, extended: true)),
+
+                // A budget and nothing else. Of these only Opus 4.5 takes a
+                // level as well.
+                ("claude-opus-4-5", .init(extended: true)),
+                ("claude-haiku-4-5", .init(extended: true, effort: false)),
+                ("claude-sonnet-4-5", .init(extended: true, effort: false)),
+            ]
+
+            for (pattern, supported) in table where id.contains(pattern) {
+                return supported
+            }
+            return .assumed
+        }
+
+        /// A thinking budget for a level, for the models that want one rather
+        /// than a name. Anthropic's floor is 1,024.
+        static func budget(for level: String) -> Int {
+            switch level {
+            case "low": 2048
+            case "medium": 4096
+            case "high": 8192
+            case "xhigh": 16384
+            default: 32768
+            }
+        }
     }
 
     /// What the caller asked for, in this provider's terms.
