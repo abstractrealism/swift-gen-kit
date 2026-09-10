@@ -108,6 +108,26 @@ extension Service {
         OpenAIService(session: session, host: hostURL, apiKey: token)
     }
 
+    /// Whether this model reaches the web by itself, with nothing asked of it.
+    ///
+    /// Server-side search is normally opt-in: a provider offers it as a tool
+    /// and it happens only when that tool is sent. These models are the
+    /// exception — searching is part of what the model *is*, not something
+    /// switched on, so it happens whether or not a caller offers any tools and
+    /// can't be switched off.
+    ///
+    /// Worth saying out loud, because an app with its own search tool
+    /// otherwise presents a switch that appears to govern something it has no
+    /// say in.
+    public func hasBuiltInWebSearch(modelID: String) -> Bool {
+        switch kind {
+        case .openAI:
+            modelID.lowercased().contains("search-preview")
+        default:
+            false
+        }
+    }
+
     /// Whether a model looks like one worth offering for a conversation.
     ///
     /// A guess from the name, and only ever a guess: OpenAI's model list
