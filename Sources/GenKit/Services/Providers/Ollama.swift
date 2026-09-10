@@ -364,6 +364,35 @@ extension OllamaService {
     /// Anything unrecognised is dropped rather than guessed at. Nil means say
     /// nothing, which leaves the model on its own default.
     private func thinking(from options: [String: Value]) -> Think? {
+        // The shared vocabulary, mapped to what this API takes. `brief` and
+        // `full` are steered by instruction rather than by the request — see
+        // `ThinkingEffort` — so `brief` still sends the level it always did
+        // and `full` sends nothing, leaving the model to do what it does
+        // unprompted. The graded levels exist for services with a real effort
+        // control and are passed through where this one understands them.
+        if let raw = options["effort"]?.stringValue {
+            switch raw {
+            case "off":
+                return .enabled(false)
+            case "brief":
+                return .level(.low)
+            case "full":
+                return nil
+            case "xhigh":
+                // No equivalent here, and `max` is the nearest thing above
+                // `high`. Reached only by a conversation carried over from a
+                // service that has the level.
+                return .level(.max)
+            default:
+                guard let level = Think.Level(rawValue: raw) else {
+                    logger.warning("ignoring unrecognised effort \(raw, privacy: .public)")
+                    return nil
+                }
+                return .level(level)
+            }
+        }
+
+        // What callers sent before there was a shared vocabulary.
         switch options["think"] {
         case .bool(let flag):
             return .enabled(flag)
