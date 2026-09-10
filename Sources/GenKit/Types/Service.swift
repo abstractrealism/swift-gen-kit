@@ -108,6 +108,45 @@ extension Service {
         OpenAIService(session: session, host: hostURL, apiKey: token)
     }
 
+    /// Whether a model looks like one worth offering for a conversation.
+    ///
+    /// A guess from the name, and only ever a guess: OpenAI's model list
+    /// reports an id and an owner and nothing about what a model does, so
+    /// there is no capability to consult. It keeps everything it has ever
+    /// served — around 130 entries, most of them video, image, audio,
+    /// embedding or moderation models, or completion models from before chat
+    /// existed — and a picker listing all of them is a picker nobody can use.
+    ///
+    /// Matched on hyphen-separated components rather than substrings, so
+    /// `text-ada-001` is caught without `ada` matching something that merely
+    /// contains those letters.
+    ///
+    /// Services that list only what's installed, or only a dozen models,
+    /// don't have this problem and everything they offer counts.
+    public func isLikelyChatModel(modelID: String) -> Bool {
+        switch kind {
+        case .openAI:
+            let notChat: Set<String> = [
+                // Other modalities.
+                "sora", "dall", "tts", "whisper", "transcribe", "audio",
+                "realtime", "speech", "image", "video",
+                // Not conversation. Note "search" is deliberately absent:
+                // the search-preview models are chat models that look things
+                // up, and the legacy `text-search-…` ones are caught by their
+                // base model's name anyway.
+                "embedding", "embeddings", "moderation", "similarity",
+                // Completion models from before chat, and harnesses that
+                // aren't a chat endpoint.
+                "davinci", "babbage", "ada", "curie", "instruct",
+                "computer", "codex", "edit",
+            ]
+            let components = Set(modelID.lowercased().split(separator: "-").map(String.init))
+            return components.isDisjoint(with: notChat)
+        default:
+            return true
+        }
+    }
+
     /// Whether a model of this service can be told not to reason.
     ///
     /// Nil where nothing is known — an unrecognised model, or a service that
