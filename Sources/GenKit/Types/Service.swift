@@ -140,8 +140,26 @@ extension Service {
                 "davinci", "babbage", "ada", "curie", "instruct",
                 "computer", "codex", "edit",
             ]
-            let components = Set(modelID.lowercased().split(separator: "-").map(String.init))
-            return components.isDisjoint(with: notChat)
+            let components = modelID.lowercased().split(separator: "-").map(String.init)
+            guard Set(components).isDisjoint(with: notChat) else { return false }
+
+            // Pinned snapshots. Most of what OpenAI keeps is dated copies of
+            // models that also exist undated — `gpt-4o-2024-05-13` beside
+            // `gpt-4o`, `gpt-4-0613` beside `gpt-4` — and they are the bulk of
+            // the list rather than a handful. All chat models, so the check
+            // above keeps every one of them, which left a picker no shorter
+            // than before.
+            //
+            // The undated name is the one to offer: it follows the current
+            // snapshot, which is what somebody picking a model from a menu
+            // means. Anyone wanting a version pinned can say so.
+            let isSnapshot = components.contains { component in
+                // A date and nothing else: 0613, 2024, 20251001. Not `4`,
+                // not `3.5`, not `32k`, not `16k`.
+                (component.count == 4 || component.count == 6 || component.count == 8)
+                    && component.allSatisfy(\.isNumber)
+            }
+            return !isSnapshot
         default:
             return true
         }
