@@ -199,6 +199,12 @@ extension AnthropicService {
             } else {
                 return nil
             }
+        case .thinking:
+            // Folded into the content as a `<think>` block, the same shape the
+            // Ollama service emits, so a caller doesn't have to know which
+            // kind of model produced the reply.
+            guard let thinking = content.thinking, !thinking.isEmpty else { return nil }
+            return .text("<think>\n" + thinking + "\n</think>")
         case .tool_use, .input_json_delta, .none, .thinking_delta, .redacted_thinking, .signature_delta:
             return nil
         }
@@ -232,7 +238,8 @@ extension AnthropicService {
                 ),
                 custom: nil
             )
-        case .text, .text_delta, .input_json_delta, .none, .thinking_delta, .redacted_thinking, .signature_delta:
+        case .text, .text_delta, .input_json_delta, .none, .thinking, .thinking_delta, .redacted_thinking,
+             .signature_delta:
             return nil
         }
     }
@@ -243,6 +250,22 @@ extension AnthropicService {
             name: model.display_name,
             owner: "anthropic"
         )
+    }
+
+    /// Closes an open `<think>` block, if the message is in one.
+    ///
+    /// Left alone otherwise, and idempotent: a reply that reasons and then
+    /// stops without answering keeps an open tag, which readers already handle
+    /// — an unterminated block runs to the end of the text, which is exactly
+    /// what an interrupted reply is.
+    private func closeThinking(_ message: inout Message) {
+        guard case .text(let existing) = message.contents?.last,
+              existing.hasPrefix("<think>"),
+              !existing.contains("</think>")
+        else {
+            return
+        }
+        message.contents![message.contents!.count-1] = .text(existing + "\n</think>")
     }
 
     private func patchMessage(_ message: inout Message, with resp: ChatResponseStream) {
@@ -259,9 +282,24 @@ extension AnthropicService {
         case .content_block_start:
             if let contentBlock = resp.content_block {
                 switch contentBlock.type {
+                case .thinking:
+                    // Opened and left open. A reader streaming the reply tells
+                    // reasoning from answer by the tag, and it's the answer
+                    // starting that closes it — see `closeThinking`. Same
+                    // shape the Ollama service composes.
+                    message.contents = [.text("<think>\n" + (contentBlock.thinking ?? ""))]
                 case .text:
+                    // Reasoning comes first and in its own block, so the
+                    // answer beginning is where it ends. Appended rather than
+                    // assigned, or the answer would replace the reasoning it
+                    // was arrived at by.
+                    closeThinking(&message)
                     if let text = contentBlock.text {
-                        message.contents = [.text(text)]
+                        if message.contents?.isEmpty ?? true {
+                            message.contents = [.text(text)]
+                        } else {
+                            message.contents?.append(.text(text))
+                        }
                     }
                 case .tool_use:
                     var toolCall = ToolCall(
@@ -281,6 +319,11 @@ extension AnthropicService {
         case .content_block_delta:
             if let delta = resp.delta {
                 switch delta.type {
+                case .thinking_delta:
+                    if case .text(let existing) = message.contents?.last {
+                        let patched = GenKit.patch(string: existing, with: delta.thinking) ?? existing
+                        message.contents![message.contents!.count-1] = .text(patched)
+                    }
                 case .text_delta:
                     if case .text(let existing) = message.contents?.last {
                         let patched = GenKit.patch(string: existing, with: delta.text) ?? existing
