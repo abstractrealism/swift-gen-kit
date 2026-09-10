@@ -108,6 +108,19 @@ extension Service {
         OpenAIService(session: session, host: hostURL, apiKey: token)
     }
 
+    /// Whether a model of this service can be told not to reason.
+    ///
+    /// Nil where nothing is known — an unrecognised model, or a service that
+    /// doesn't distinguish. Only `false` is a fact worth acting on.
+    public func canDisableThinking(modelID: String) -> Bool? {
+        switch kind {
+        case .anthropic:
+            AnthropicService.canDisableThinking(modelID: modelID)
+        default:
+            nil
+        }
+    }
+
     public func modelService(session: URLSession?) -> ModelService {
         switch kind {
         case .anthropic:
