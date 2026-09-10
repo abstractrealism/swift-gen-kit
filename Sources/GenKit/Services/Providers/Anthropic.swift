@@ -116,6 +116,7 @@ extension AnthropicService: ChatService {
             options: request.options
         )
         req.temperature = temperature(from: request.options, model: request.model)
+        log(req, streaming: false)
         let result = try await client.chatCompletions(req)
         return decode(result)
     }
@@ -129,12 +130,52 @@ extension AnthropicService: ChatService {
         )
         req.temperature = temperature(from: request.options, model: request.model)
         req.stream = true
+        log(req, streaming: true)
 
         var message = Message(role: .assistant)
-        for try await result in try client.chatCompletionsStream(req) {
-            patchMessage(&message, with: result)
-            try await update(message)
+        var seen: [String: Int] = [:]
+        do {
+            for try await result in try client.chatCompletionsStream(req) {
+                seen[result.type.rawValue, default: 0] += 1
+                patchMessage(&message, with: result)
+                try await update(message)
+            }
+        } catch {
+            logger.error(
+                "← anthropic stream failed after \(self.describe(seen), privacy: .public): \(error, privacy: .public)"
+            )
+            throw error
         }
+        logger.info("← anthropic stream finished | \(self.describe(seen), privacy: .public)")
+    }
+
+    /// What was asked for, in the terms the service was asked in.
+    ///
+    /// Counts and settings only, never the messages: this is for telling why a
+    /// request was refused, and a conversation's contents don't answer that.
+    private func log(_ req: Anthropic.ChatRequest, streaming: Bool) {
+        let thinking = req.thinking.map { thinking in
+            thinking.display.map { "\(thinking.type)/\($0)" } ?? thinking.type
+        } ?? "unset"
+        logger.info("""
+            → anthropic \(streaming ? "stream" : "completion", privacy: .public) \
+            | model: \(req.model, privacy: .public) \
+            | thinking: \(thinking, privacy: .public) \
+            | effort: \(req.output_config?.effort ?? "unset", privacy: .public) \
+            | max_tokens: \(req.max_tokens, privacy: .public) \
+            | temperature: \(req.temperature.map { "\($0)" } ?? "unset", privacy: .public) \
+            | tools: \(req.tools?.count ?? 0, privacy: .public) \
+            | system: \(req.system?.count ?? 0, privacy: .public) \
+            | messages: \(req.messages.count, privacy: .public)
+            """)
+    }
+
+    private func describe(_ events: [String: Int]) -> String {
+        guard !events.isEmpty else { return "no events" }
+        return events
+            .sorted { $0.key < $1.key }
+            .map { "\($0.key)×\($0.value)" }
+            .joined(separator: " ")
     }
 }
 
