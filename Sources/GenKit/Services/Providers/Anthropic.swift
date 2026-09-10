@@ -14,15 +14,93 @@ public actor AnthropicService {
         self.client = .init(session: session, host: host, apiKey: apiKey)
     }
 
-    private func makeRequest(model: Model, messages: [Message], tools: [Tool] = [], toolChoice: Tool? = nil) -> Anthropic.ChatRequest {
-        .init(
+    private func makeRequest(
+        model: Model,
+        messages: [Message],
+        tools: [Tool] = [],
+        toolChoice: Tool? = nil,
+        options: [String: Value] = [:]
+    ) -> Anthropic.ChatRequest {
+        var req = Anthropic.ChatRequest(
             model: model.id,
             messages: encode(messages: messages),
-            max_tokens: model.maxOutput ?? 8192,
+            // Bounds the reasoning and the reply together, so a figure chosen
+            // when replies were the only output can now be spent thinking and
+            // leave the answer truncated. The caller's setting wins; failing
+            // that the model's own ceiling; failing that a figure with room in
+            // it for both.
+            max_tokens: options["max_tokens"]?.intValue ?? model.maxOutput ?? 16384,
             system: encodeSystemPrompt(from: messages),
             tool_choice: encode(toolChoice),
             tools: encode(tools)
         )
+
+        // Reasoning, and how much work to put in overall. Two settings rather
+        // than one: `thinking` decides whether the model reasons at all, and
+        // `effort` how deeply — including how deeply it reasons when it does.
+        //
+        // `summarized` because the default is `omitted`, under which the
+        // blocks still arrive carrying a signature and no text. A caller that
+        // means to show reasoning has to say so.
+        switch effort(from: options) {
+        case .none:
+            break
+        case .off:
+            req.thinking = .disabled
+        case .level(let level):
+            req.thinking = .adaptive(display: "summarized")
+            req.output_config = .init(effort: level)
+        }
+
+        return req
+    }
+
+    /// The temperature to send, if any.
+    ///
+    /// Newer models reject a non-default `temperature`, `top_p` or `top_k`
+    /// with a 400 on **every** request, whether or not thinking is involved —
+    /// so passing one through unconditionally turns the first model that says
+    /// so into a service that can't answer at all. Since nothing has needed to
+    /// set one here, the safe reading of a value we can't check per model is
+    /// to drop it and say so, rather than to fail the send.
+    private func temperature(from options: [String: Value], model: Model) -> Double? {
+        guard let temperature = options["temperature"]?.doubleValue else { return nil }
+        logger.warning(
+            "\(model.id, privacy: .public): dropping temperature \(temperature, privacy: .public) — models from Claude Sonnet 5 and Opus 4.7 onwards reject any non-default sampling value"
+        )
+        return nil
+    }
+
+    /// What the caller asked for, in this provider's terms.
+    private enum Effort {
+        case none
+        case off
+        case level(String)
+    }
+
+    /// Maps the caller's effort onto what this API takes.
+    ///
+    /// `brief` and `full` are the steered pair local models use, where the
+    /// grading is done by instruction rather than by the request — here there
+    /// is a real control, so they land on the levels that mean the same thing.
+    private func effort(from options: [String: Value]) -> Effort {
+        guard let raw = options["effort"]?.stringValue else { return .none }
+        switch raw {
+        case "off":
+            return .off
+        case "brief":
+            return .level("low")
+        case "full":
+            // The API's own default, and the docs are explicit that passing it
+            // is identical to passing nothing. Said out loud anyway, so the
+            // request describes what was asked for.
+            return .level("high")
+        case "low", "medium", "high", "xhigh", "max":
+            return .level(raw)
+        default:
+            logger.warning("ignoring unrecognised effort \(raw, privacy: .public)")
+            return .none
+        }
     }
 }
 
@@ -31,15 +109,25 @@ public actor AnthropicService {
 extension AnthropicService: ChatService {
 
     public func completion(_ request: ChatServiceRequest) async throws -> Message {
-        var req = makeRequest(model: request.model, messages: request.messages, tools: request.tools)
-        req.temperature = request.options["temperature"]?.doubleValue
+        var req = makeRequest(
+            model: request.model,
+            messages: request.messages,
+            tools: request.tools,
+            options: request.options
+        )
+        req.temperature = temperature(from: request.options, model: request.model)
         let result = try await client.chatCompletions(req)
         return decode(result)
     }
 
     public func completionStream(_ request: ChatServiceRequest, update: (Message) async throws -> Void) async throws {
-        var req = makeRequest(model: request.model, messages: request.messages, tools: request.tools)
-        req.temperature = request.options["temperature"]?.doubleValue
+        var req = makeRequest(
+            model: request.model,
+            messages: request.messages,
+            tools: request.tools,
+            options: request.options
+        )
+        req.temperature = temperature(from: request.options, model: request.model)
         req.stream = true
 
         var message = Message(role: .assistant)
