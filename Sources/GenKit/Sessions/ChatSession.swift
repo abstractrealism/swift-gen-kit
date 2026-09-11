@@ -278,11 +278,35 @@ public struct ChatSessionResponse: Sendable {
     }
 }
 
-enum ChatSessionError: Error {
+/// Public, so a caller can tell these apart from a service's own failures.
+/// Thrown across the module boundary but declared internal, they reached an
+/// app only as a string — "maxRunLoopLimit" — which is neither matchable nor
+/// something a person can act on.
+public enum ChatSessionError: Error, CustomStringConvertible {
     case missingMessage
     case missingToolCalls
     case missingToolCall
     case missingTool
+    /// The run loop went round `runLoopLimit` times — a tool call answered
+    /// and the model calling again, every time — without the model ever
+    /// finishing an answer. A ceiling on rounds of tool calls, not on tokens.
     case maxRunLoopLimit
     case unknown
+
+    public var description: String {
+        switch self {
+        case .missingMessage:
+            "The response carried no message."
+        case .missingToolCalls:
+            "The message carried no tool calls to process."
+        case .missingToolCall:
+            "A tool call was expected and not found."
+        case .missingTool:
+            "The model called a tool this session doesn't have."
+        case .maxRunLoopLimit:
+            "The model kept calling tools without finishing an answer, and the limit on rounds of tool calls was reached."
+        case .unknown:
+            "An unknown chat session error occurred."
+        }
+    }
 }
