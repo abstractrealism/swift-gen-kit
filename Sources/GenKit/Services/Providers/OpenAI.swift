@@ -7,12 +7,25 @@ private let logger = Logger(subsystem: "OpenAIService", category: "GenKit")
 
 public actor OpenAIService {
 
+    /// Which OpenAI-shaped endpoint this is talking to.
+    ///
+    /// One client serves several services that speak the same protocol and
+    /// disagree at the edges: which reasoning levels a model takes, which
+    /// name the token ceiling goes by, where reasoning comes back. The host
+    /// could say, but a proxy or a mirror would then be misread, so the
+    /// service that made this says outright.
+    public enum Dialect: String, Sendable {
+        case openAI, deepSeek, grok, groq, openRouter
+    }
+
     private var client: OpenAI.Client
     private let session: URLSession
+    private let dialect: Dialect
 
-    public init(session: URLSession? = nil, host: URL? = nil, apiKey: String) {
+    public init(session: URLSession? = nil, host: URL? = nil, apiKey: String, dialect: Dialect = .openAI) {
         self.client = .init(session: session, host: host, apiKey: apiKey)
         self.session = session ?? URLSession(configuration: .default)
+        self.dialect = dialect
     }
 }
 
@@ -21,15 +34,7 @@ public actor OpenAIService {
 extension OpenAIService: ChatService {
 
     public func completion(_ request: ChatServiceRequest) async throws -> Message {
-            let req = ChatRequest(
-                messages: encode(messages: request.messages),
-                model: request.model.id,
-                reasoning_effort: request.options["reasoning_effort"]?.stringValue.flatMap(OpenAI.ChatRequest.ReasoningEffort.init),
-                temperature: request.options["temperature"]?.doubleValue,
-                tools: encode(request.tools),
-                tool_choice: encode(request.toolChoice),
-                verbosity: request.options["verbosity"]?.stringValue.flatMap(OpenAI.ChatRequest.Verbosity.init)
-            )
+            let req = makeRequest(request, streaming: false)
             log(req, streaming: false)
             let resp: OpenAI.ChatResponse
             do {
@@ -48,16 +53,7 @@ extension OpenAIService: ChatService {
         }
 
         public func completionStream(_ request: ChatServiceRequest, update: (Message) async throws -> Void) async throws {
-            let req = OpenAI.ChatRequest(
-                messages: encode(messages: request.messages),
-                model: request.model.id,
-                reasoning_effort: request.options["reasoning_effort"]?.stringValue.flatMap(OpenAI.ChatRequest.ReasoningEffort.init),
-                stream: true,
-                temperature: request.options["temperature"]?.doubleValue,
-                tools: encode(request.tools),
-                tool_choice: encode(request.toolChoice),
-                verbosity: request.options["verbosity"]?.stringValue.flatMap(OpenAI.ChatRequest.Verbosity.init)
-            )
+            let req = makeRequest(request, streaming: true)
             log(req, streaming: true)
 
             var message = Message(role: .assistant)
@@ -76,6 +72,184 @@ extension OpenAIService: ChatService {
             }
             logger.info("← \(self.hostName, privacy: .public) stream finished | \(self.describe(seen), privacy: .public)")
         }
+}
+
+// MARK: - Requests
+
+extension OpenAIService {
+
+    private func makeRequest(_ request: ChatServiceRequest, streaming: Bool) -> OpenAI.ChatRequest {
+        var req = OpenAI.ChatRequest(
+            messages: encode(messages: request.messages),
+            model: request.model.id,
+            stream: streaming ? true : nil,
+            temperature: request.options["temperature"]?.doubleValue,
+            tools: encode(request.tools),
+            tool_choice: encode(request.toolChoice),
+            verbosity: request.options["verbosity"]?.stringValue.flatMap(OpenAI.ChatRequest.Verbosity.init)
+        )
+        req.reasoning_effort = reasoningEffort(from: request.options, model: request.model)
+
+        // The ceiling goes by two names. OpenAI deprecated `max_tokens` for
+        // `max_completion_tokens` and its reasoning models reject the old one;
+        // DeepSeek documents `max_tokens` and nothing else.
+        if let ceiling = request.options["max_tokens"]?.intValue {
+            switch dialect {
+            case .deepSeek:
+                req.max_tokens = ceiling
+            case .openAI, .grok, .groq, .openRouter:
+                req.max_completion_tokens = ceiling
+            }
+        }
+        return req
+    }
+
+    /// What `reasoning_effort` to send, if anything.
+    ///
+    /// The caller's `effort` is provider-neutral — see the levels below — and
+    /// what a model accepts is the model's own business: the API refuses what
+    /// it doesn't take rather than ignoring it, and a model that doesn't
+    /// reason refuses the parameter altogether. So this asks the table first,
+    /// and asks for the nearest thing where the exact level isn't offered.
+    nonisolated func reasoningEffort(from options: [String: Value], model: Model) -> OpenAI.ChatRequest.ReasoningEffort? {
+        // A caller speaking the API's own terms is taken at its word.
+        if let raw = options["reasoning_effort"]?.stringValue {
+            return .init(rawValue: raw)
+        }
+        guard let raw = options["effort"]?.stringValue else { return nil }
+
+        guard let levels = Reasoning.supported(byModel: model.id, dialect: dialect).levels else {
+            // Either the model takes no such setting — in which case Off is
+            // already true of it — or nothing is known, and a guess here is a
+            // 400 if wrong where leaving it alone is merely the default.
+            if raw != "off" {
+                logger.info("\(model.id, privacy: .public) takes no known reasoning setting; leaving it to the model")
+            }
+            return nil
+        }
+
+        let wanted: String
+        switch raw {
+        case "off":
+            wanted = "none"
+        case "brief":
+            // The steered pair local models use. Here the request grades it.
+            wanted = "low"
+        case "full":
+            // Whatever the model does unprompted, which is what sending
+            // nothing asks for.
+            return nil
+        case "low", "medium", "high", "xhigh", "max":
+            wanted = raw
+        default:
+            logger.warning("ignoring unrecognised effort \(raw, privacy: .public)")
+            return nil
+        }
+
+        if levels.contains(wanted) {
+            return .init(rawValue: wanted)
+        }
+
+        // Not offered, so the nearest that is: `xhigh` on a model that stops
+        // at `high` gets `high`; `none` on a model that can't stop gets the
+        // least it will do. Ties go to the lower level.
+        let order = Reasoning.order
+        guard let target = order.firstIndex(of: wanted) else { return nil }
+        let nearest = levels
+            .compactMap { level in order.firstIndex(of: level).map { (level, abs($0 - target)) } }
+            .min { $0.1 < $1.1 }?.0
+        guard let nearest else { return nil }
+
+        if wanted == "none" {
+            logger.info(
+                "\(model.id, privacy: .public) can't be told not to reason; asking for the least, \(nearest, privacy: .public)"
+            )
+        } else {
+            logger.info(
+                "\(model.id, privacy: .public) doesn't take \(wanted, privacy: .public); asking for \(nearest, privacy: .public)"
+            )
+        }
+        return .init(rawValue: nearest)
+    }
+
+    /// Whether a model can be told not to reason, where that's known.
+    ///
+    /// True where it takes `none`, or `minimal` — which is as near to none as
+    /// gpt-5 gets, and nearer than any level a menu offers. False where the
+    /// least it takes is `low`. Nil where it takes no such setting at all,
+    /// since a model that never reasons has nothing to switch off, or where
+    /// nothing is known — only a fact is worth acting on.
+    public nonisolated static func canDisableThinking(modelID: String, dialect: Dialect) -> Bool? {
+        guard let levels = Reasoning.supported(byModel: modelID, dialect: dialect).levels else { return nil }
+        return levels.contains("none") || levels.contains("minimal")
+    }
+
+    /// What a model accepts for `reasoning_effort`.
+    ///
+    /// There is no endpoint that says. The API refuses a value a model doesn't
+    /// take, with a message naming the ones it does, and that is where every
+    /// row here came from:
+    ///
+    ///     gpt-5       minimal, low, medium, high
+    ///     gpt-5.6     none, low, medium, high, xhigh
+    ///     gpt-4o      refuses the parameter altogether
+    ///     DeepSeek    none, minimal, low, medium, high, xhigh, max
+    ///
+    /// DeepSeek's is the endpoint's own vocabulary, checked before any model
+    /// is; whether every one of its models honours every level is not yet
+    /// measured. The o-series row is from the documentation rather than a
+    /// refusal, and `o1-mini` and `o1-preview` are documented as taking none.
+    /// Grok, Groq and OpenRouter are unmeasured and get nothing, which is the
+    /// safe failure: a level not sent is the model's default, where a level
+    /// refused is no answer at all.
+    struct Reasoning {
+        /// Ascending. Nil where the model takes no such setting.
+        let levels: [String]?
+
+        /// Every level any endpoint has named, least to most.
+        static let order = ["none", "minimal", "low", "medium", "high", "xhigh", "max"]
+
+        static func supported(byModel id: String, dialect: Dialect) -> Reasoning {
+            switch dialect {
+            case .deepSeek:
+                return Reasoning(levels: order)
+            case .grok, .groq, .openRouter:
+                return Reasoning(levels: nil)
+            case .openAI:
+                break
+            }
+
+            if id.hasPrefix("o1-mini") || id.hasPrefix("o1-preview") {
+                return Reasoning(levels: nil)
+            }
+            if let first = id.first, first == "o", id.dropFirst().first?.isNumber == true {
+                return Reasoning(levels: ["low", "medium", "high"])
+            }
+
+            // The generation decides, and it's in the id: 5 for gpt-5-mini,
+            // 5.6 for gpt-5.6-sol, 4.1 for gpt-4.1, 4 for gpt-4o. `none` and
+            // `xhigh` arrived with 5.1; before that the least was `minimal`.
+            // Anything newer than what's been measured is assumed to take the
+            // newest vocabulary, an unknown id being likelier new than old.
+            guard let generation = gptGeneration(of: id) else {
+                return Reasoning(levels: nil)
+            }
+            if generation >= 5.1 {
+                return Reasoning(levels: ["none", "low", "medium", "high", "xhigh"])
+            }
+            if generation >= 5 {
+                return Reasoning(levels: ["minimal", "low", "medium", "high"])
+            }
+            return Reasoning(levels: nil)
+        }
+
+        /// The number after `gpt-`, read as far as it stays a number.
+        private static func gptGeneration(of id: String) -> Double? {
+            guard id.hasPrefix("gpt-") else { return nil }
+            let digits = id.dropFirst(4).prefix { $0.isNumber || $0 == "." }
+            return Double(digits)
+        }
+    }
 }
 
 // MARK: - Logging
@@ -100,6 +274,7 @@ extension OpenAIService {
             | reasoning_effort: \(req.reasoning_effort?.rawValue ?? "unset", privacy: .public) \
             | verbosity: \(req.verbosity?.rawValue ?? "unset", privacy: .public) \
             | max_completion_tokens: \(req.max_completion_tokens.map { "\($0)" } ?? "unset", privacy: .public) \
+            | max_tokens: \(req.max_tokens.map { "\($0)" } ?? "unset", privacy: .public) \
             | temperature: \(req.temperature.map { "\($0)" } ?? "unset", privacy: .public) \
             | tools: \(req.tools?.count ?? 0, privacy: .public) \
             | messages: \(req.messages.count, privacy: .public)
@@ -396,9 +571,13 @@ extension OpenAIService {
 
     private func decode(_ resp: OpenAI.ChatResponse) -> Message? {
         guard let choice = resp.choices.first else { return nil }
+        let reasoning = choice.message.reasoning_content ?? ""
+        let text = reasoning.isEmpty
+            ? choice.message.content
+            : compose(thinking: reasoning, answer: choice.message.content ?? "")
         return Message(
             role: decode(choice.message.role),
-            contents: [decode(choice.message.content)].compactMap { $0 },
+            contents: [decode(text)].compactMap { $0 },
             toolCalls: choice.message.tool_calls?.map { decode($0) },
             finishReason: decode(choice.finish_reason)
         )
@@ -424,7 +603,7 @@ extension OpenAIService {
         return .text(content)
     }
     
-    private func decode(_ reason: String?) -> Message.FinishReason? {
+    nonisolated private func decode(_ reason: String?) -> Message.FinishReason? {
         switch reason {
         case "stop":
             return .stop
@@ -439,7 +618,7 @@ extension OpenAIService {
         }
     }
     
-    private func decode(_ resp: OpenAI.ChatResponse.Choice.Message.ToolCall) -> ToolCall {
+    nonisolated private func decode(_ resp: OpenAI.ChatResponse.Choice.Message.ToolCall) -> ToolCall {
         ToolCall(
             index: resp.index,
             id: resp.id ?? "",
@@ -463,10 +642,34 @@ extension OpenAIService {
         )
     }
     
-    private func patchMessage(_ message: inout Message, with resp: OpenAI.ChatStreamResponse) {
+    /// Folds reasoning into the content as a `<think>` block.
+    ///
+    /// The shape Ollama's reasoning already takes, so a reader needn't know
+    /// which provider a reply came from; see `OllamaService.compose`. Left
+    /// open until the answer starts, so a reader streaming the reply can tell
+    /// reasoning from answer as it arrives.
+    nonisolated private func compose(thinking: String, answer: String) -> String {
+        guard !thinking.isEmpty else { return answer }
+        let closing = answer.isEmpty ? "" : "\n</think>\n"
+        return "<think>\n" + thinking + closing + answer
+    }
+
+    nonisolated func patchMessage(_ message: inout Message, with resp: OpenAI.ChatStreamResponse) {
         guard let choice = resp.choices.first else { return }
 
-        if case .text(let text) = message.contents?.last {
+        // Where the endpoint returns reasoning in the open, it and the answer
+        // stream as separate deltas — DeepSeek sends `reasoning_content` a few
+        // characters at a time with `content` null, then the reverse. So each
+        // is accumulated and the combined content rebuilt from both every
+        // time, as the Ollama provider does.
+        if choice.delta.reasoning_content != nil || message.metadata["thinking"] != nil {
+            let thinking = (message.metadata["thinking"]?.stringValue ?? "") + (choice.delta.reasoning_content ?? "")
+            let answer = (message.metadata["answer"]?.stringValue ?? "") + (choice.delta.content ?? "")
+
+            message.metadata["thinking"] = .string(thinking)
+            message.metadata["answer"] = .string(answer)
+            message.contents = [.text(compose(thinking: thinking, answer: answer))]
+        } else if case .text(let text) = message.contents?.last {
             if let patched = GenKit.patch(string: text, with: choice.delta.content) {
                 message.contents = [.text(patched)]
             }
