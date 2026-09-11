@@ -73,7 +73,7 @@ extension Service {
     }
 
     public func deepseek(session: URLSession?) -> OpenAIService {
-        OpenAIService(session: session, host: hostURL, apiKey: token)
+        OpenAIService(session: session, host: hostURL, apiKey: token, dialect: .deepSeek)
     }
 
     public func elevenLabs(session: URLSession?) -> ElevenLabsService {
@@ -85,11 +85,11 @@ extension Service {
     }
 
     public func grok(session: URLSession?) -> OpenAIService {
-        OpenAIService(session: session, host: hostURL, apiKey: token)
+        OpenAIService(session: session, host: hostURL, apiKey: token, dialect: .grok)
     }
 
     public func groq(session: URLSession?) -> OpenAIService {
-        OpenAIService(session: session, host: hostURL, apiKey: token)
+        OpenAIService(session: session, host: hostURL, apiKey: token, dialect: .groq)
     }
 
     public func mistral(session: URLSession?) -> MistralService {
@@ -105,7 +105,7 @@ extension Service {
     }
 
     public func openRouter(session: URLSession?) -> OpenAIService {
-        OpenAIService(session: session, host: hostURL, apiKey: token)
+        OpenAIService(session: session, host: hostURL, apiKey: token, dialect: .openRouter)
     }
 
     /// Whether this model reaches the web by itself, with nothing asked of it.
@@ -193,6 +193,10 @@ extension Service {
         switch kind {
         case .anthropic:
             AnthropicService.canDisableThinking(modelID: modelID)
+        case .openAI:
+            OpenAIService.canDisableThinking(modelID: modelID, dialect: .openAI)
+        case .deepseek:
+            OpenAIService.canDisableThinking(modelID: modelID, dialect: .deepSeek)
         default:
             nil
         }
