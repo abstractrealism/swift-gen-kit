@@ -88,7 +88,14 @@ extension OpenAIService {
             tool_choice: encode(request.toolChoice),
             verbosity: request.options["verbosity"]?.stringValue.flatMap(OpenAI.ChatRequest.Verbosity.init)
         )
-        req.reasoning_effort = reasoningEffort(from: request.options, model: request.model)
+        switch reasoning(from: request.options, model: request.model) {
+        case .nothing:
+            break
+        case .effort(let level):
+            req.reasoning_effort = level
+        case .thinkingOff:
+            req.thinking = .disabled
+        }
 
         // The ceiling goes by two names. OpenAI deprecated `max_tokens` for
         // `max_completion_tokens` and its reasoning models reject the old one;
@@ -104,33 +111,45 @@ extension OpenAIService {
         return req
     }
 
-    /// What `reasoning_effort` to send, if anything.
+    /// What to send about reasoning, if anything.
+    enum ReasoningSetting: Equatable {
+        case nothing
+        case effort(OpenAI.ChatRequest.ReasoningEffort)
+        /// DeepSeek's switch: it has no level that means none.
+        case thinkingOff
+    }
+
+    /// What to ask for, in this endpoint's terms.
     ///
     /// The caller's `effort` is provider-neutral — see the levels below — and
     /// what a model accepts is the model's own business: the API refuses what
     /// it doesn't take rather than ignoring it, and a model that doesn't
     /// reason refuses the parameter altogether. So this asks the table first,
     /// and asks for the nearest thing where the exact level isn't offered.
-    nonisolated func reasoningEffort(from options: [String: Value], model: Model) -> OpenAI.ChatRequest.ReasoningEffort? {
+    nonisolated func reasoning(from options: [String: Value], model: Model) -> ReasoningSetting {
         // A caller speaking the API's own terms is taken at its word.
         if let raw = options["reasoning_effort"]?.stringValue {
-            return .init(rawValue: raw)
+            return OpenAI.ChatRequest.ReasoningEffort(rawValue: raw).map { .effort($0) } ?? .nothing
         }
-        guard let raw = options["effort"]?.stringValue else { return nil }
+        guard let raw = options["effort"]?.stringValue else { return .nothing }
 
-        guard let levels = Reasoning.supported(byModel: model.id, dialect: dialect).levels else {
+        let supported = Reasoning.supported(byModel: model.id, dialect: dialect)
+        guard let levels = supported.levels else {
             // Either the model takes no such setting — in which case Off is
             // already true of it — or nothing is known, and a guess here is a
             // 400 if wrong where leaving it alone is merely the default.
             if raw != "off" {
                 logger.info("\(model.id, privacy: .public) takes no known reasoning setting; leaving it to the model")
             }
-            return nil
+            return .nothing
         }
 
-        let wanted: String
+        var wanted: String
         switch raw {
         case "off":
+            // Where there's a switch, throw it: a level that means none is
+            // the exception, not the rule.
+            if supported.offSwitch { return .thinkingOff }
             wanted = "none"
         case "brief":
             // The steered pair local models use. Here the request grades it.
@@ -138,27 +157,33 @@ extension OpenAIService {
         case "full":
             // Whatever the model does unprompted, which is what sending
             // nothing asks for.
-            return nil
+            return .nothing
         case "low", "medium", "high", "xhigh", "max":
             wanted = raw
         default:
             logger.warning("ignoring unrecognised effort \(raw, privacy: .public)")
-            return nil
+            return .nothing
         }
 
-        if levels.contains(wanted) {
-            return .init(rawValue: wanted)
+        // An endpoint that maps some levels onto others is followed rather
+        // than second-guessed — DeepSeek documents medium as high.
+        if let alias = supported.aliases[wanted] {
+            wanted = alias
+        }
+
+        if levels.contains(wanted), let level = OpenAI.ChatRequest.ReasoningEffort(rawValue: wanted) {
+            return .effort(level)
         }
 
         // Not offered, so the nearest that is: `xhigh` on a model that stops
         // at `high` gets `high`; `none` on a model that can't stop gets the
         // least it will do. Ties go to the lower level.
         let order = Reasoning.order
-        guard let target = order.firstIndex(of: wanted) else { return nil }
+        guard let target = order.firstIndex(of: wanted) else { return .nothing }
         let nearest = levels
             .compactMap { level in order.firstIndex(of: level).map { (level, abs($0 - target)) } }
             .min { $0.1 < $1.1 }?.0
-        guard let nearest else { return nil }
+        guard let nearest, let level = OpenAI.ChatRequest.ReasoningEffort(rawValue: nearest) else { return .nothing }
 
         if wanted == "none" {
             logger.info(
@@ -169,7 +194,7 @@ extension OpenAIService {
                 "\(model.id, privacy: .public) doesn't take \(wanted, privacy: .public); asking for \(nearest, privacy: .public)"
             )
         }
-        return .init(rawValue: nearest)
+        return .effort(level)
     }
 
     /// Whether a model can be told not to reason, where that's known.
@@ -180,8 +205,9 @@ extension OpenAIService {
     /// since a model that never reasons has nothing to switch off, or where
     /// nothing is known — only a fact is worth acting on.
     public nonisolated static func canDisableThinking(modelID: String, dialect: Dialect) -> Bool? {
-        guard let levels = Reasoning.supported(byModel: modelID, dialect: dialect).levels else { return nil }
-        return levels.contains("none") || levels.contains("minimal")
+        let supported = Reasoning.supported(byModel: modelID, dialect: dialect)
+        guard let levels = supported.levels else { return nil }
+        return supported.offSwitch || levels.contains("none") || levels.contains("minimal")
     }
 
     /// What a model accepts for `reasoning_effort`.
@@ -193,18 +219,26 @@ extension OpenAIService {
     ///     gpt-5       minimal, low, medium, high
     ///     gpt-5.6     none, low, medium, high, xhigh
     ///     gpt-4o      refuses the parameter altogether
-    ///     DeepSeek    none, minimal, low, medium, high, xhigh, max
     ///
-    /// DeepSeek's is the endpoint's own vocabulary, checked before any model
-    /// is; whether every one of its models honours every level is not yet
-    /// measured. The o-series row is from the documentation rather than a
-    /// refusal, and `o1-mini` and `o1-preview` are documented as taking none.
-    /// Grok, Groq and OpenRouter are unmeasured and get nothing, which is the
-    /// safe failure: a level not sent is the model's default, where a level
-    /// refused is no answer at all.
+    /// DeepSeek is from its Thinking Mode guide rather than a refusal. Its
+    /// endpoint accepts all seven names but has three levels — low, high and
+    /// max — and documents the rest as aliases: minimal is low, medium and
+    /// xhigh are high. It is switched off with its own `thinking` parameter,
+    /// not a level; thinking is on by default at high. The o-series row is
+    /// from the documentation too, and `o1-mini` and `o1-preview` are
+    /// documented as taking none. Grok, Groq and OpenRouter are unmeasured
+    /// and get nothing, which is the safe failure: a level not sent is the
+    /// model's default, where a level refused is no answer at all.
     struct Reasoning {
         /// Ascending. Nil where the model takes no such setting.
         let levels: [String]?
+
+        /// Levels the endpoint accepts and reads as another, as documented.
+        var aliases: [String: String] = [:]
+
+        /// Whether thinking is turned off with a switch of its own rather
+        /// than a level.
+        var offSwitch = false
 
         /// Every level any endpoint has named, least to most.
         static let order = ["none", "minimal", "low", "medium", "high", "xhigh", "max"]
@@ -212,7 +246,11 @@ extension OpenAIService {
         static func supported(byModel id: String, dialect: Dialect) -> Reasoning {
             switch dialect {
             case .deepSeek:
-                return Reasoning(levels: order)
+                return Reasoning(
+                    levels: ["low", "high", "max"],
+                    aliases: ["minimal": "low", "medium": "high", "xhigh": "high"],
+                    offSwitch: true
+                )
             case .grok, .groq, .openRouter:
                 return Reasoning(levels: nil)
             case .openAI:
@@ -272,6 +310,7 @@ extension OpenAIService {
             → \(self.hostName, privacy: .public) \(streaming ? "stream" : "completion", privacy: .public) \
             | model: \(req.model, privacy: .public) \
             | reasoning_effort: \(req.reasoning_effort?.rawValue ?? "unset", privacy: .public) \
+            | thinking: \(req.thinking?.type ?? "unset", privacy: .public) \
             | verbosity: \(req.verbosity?.rawValue ?? "unset", privacy: .public) \
             | max_completion_tokens: \(req.max_completion_tokens.map { "\($0)" } ?? "unset", privacy: .public) \
             | max_tokens: \(req.max_tokens.map { "\($0)" } ?? "unset", privacy: .public) \
@@ -416,19 +455,43 @@ extension OpenAIService: SpeechService {
 
 extension OpenAIService {
 
-    private func encode(messages: [Message]) -> [OpenAI.ChatRequest.Message] {
+    /// The encoder, reachable by a test. Not otherwise part of the API.
+    nonisolated func encodeForTest(messages: [Message]) -> [OpenAI.ChatRequest.Message] {
+        encode(messages: messages)
+    }
+
+    nonisolated private func encode(messages: [Message]) -> [OpenAI.ChatRequest.Message] {
         messages.map { message in
-            OpenAI.ChatRequest.Message(
+            var encoded = OpenAI.ChatRequest.Message(
                 content: encode(message.contents, role: message.role),
                 role: encode(message.role),
                 name: message.name,
                 tool_calls: encode(message.toolCalls),
                 tool_call_id: message.toolCallID
             )
+
+            // A reply that reasoned in the open keeps its reasoning and its
+            // answer apart in metadata (see `patchMessage`), and DeepSeek
+            // wants them back that way: the reasoning as `reasoning_content`
+            // — required on every assistant message whenever tools are sent,
+            // a 400 without it — and the answer alone as content, rather than
+            // the folded `<think>` block it never wrote. Sent to no one else:
+            // OpenAI refuses the field on input.
+            if dialect == .deepSeek, message.role == .assistant,
+               let thinking = message.metadata["thinking"]?.stringValue {
+                encoded.reasoning_content = thinking
+                if let answer = message.metadata["answer"]?.stringValue {
+                    // Kept even when empty — a round that only called tools
+                    // has no answer, and `content: ""` is what its own guide
+                    // sends back for that.
+                    encoded.content = [.init(type: "text", text: answer)]
+                }
+            }
+            return encoded
         }
     }
 
-    private func encode(_ contents: [Message.Content]?, role: Message.Role) -> [OpenAI.ChatRequest.Message.Content]? {
+    nonisolated private func encode(_ contents: [Message.Content]?, role: Message.Role) -> [OpenAI.ChatRequest.Message.Content]? {
         contents?.map {
             switch $0 {
             case .text(let text):
@@ -464,7 +527,7 @@ extension OpenAIService {
         }.compactMap({$0})
     }
 
-    private func encode(_ role: Message.Role) -> OpenAI.ChatRequest.Message.Role {
+    nonisolated private func encode(_ role: Message.Role) -> OpenAI.ChatRequest.Message.Role {
         switch role {
         case .system: .system
         case .assistant: .assistant
@@ -473,7 +536,7 @@ extension OpenAIService {
         }
     }
 
-    private func encode(_ toolCalls: [ToolCall]?) -> [OpenAI.ChatRequest.Message.ToolCall]? {
+    nonisolated private func encode(_ toolCalls: [ToolCall]?) -> [OpenAI.ChatRequest.Message.ToolCall]? {
         toolCalls?.map { toolCall in
             OpenAI.ChatRequest.Message.ToolCall(
                 id: toolCall.id,
@@ -484,12 +547,12 @@ extension OpenAIService {
         }
     }
 
-    private func encode(_ functionCall: ToolCall.Function?) -> OpenAI.ChatRequest.Message.ToolCall.Function? {
+    nonisolated private func encode(_ functionCall: ToolCall.Function?) -> OpenAI.ChatRequest.Message.ToolCall.Function? {
         guard let functionCall else { return nil }
         return .init(name: functionCall.name, arguments: functionCall.arguments)
     }
 
-    private func encode(_ customCall: ToolCall.Custom?) -> OpenAI.ChatRequest.Message.ToolCall.Custom? {
+    nonisolated private func encode(_ customCall: ToolCall.Custom?) -> OpenAI.ChatRequest.Message.ToolCall.Custom? {
         guard let customCall else { return nil }
         return .init(name: customCall.name, input: customCall.input)
     }

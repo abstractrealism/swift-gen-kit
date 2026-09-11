@@ -7,10 +7,16 @@ import OpenAI
 /// API's own refusals; these pin what's sent for each of them.
 final class OpenAIReasoningTests: XCTestCase {
 
+    /// The `reasoning_effort` that would be sent, or "thinking:disabled"
+    /// where the endpoint is switched off instead, or nil for nothing.
     private func sent(_ effort: String, to modelID: String, dialect: OpenAIService.Dialect = .openAI) -> String? {
         let service = OpenAIService(apiKey: "test", dialect: dialect)
         let model = Model(id: modelID, owner: "test")
-        return service.reasoningEffort(from: ["effort": .string(effort)], model: model)?.rawValue
+        switch service.reasoning(from: ["effort": .string(effort)], model: model) {
+        case .nothing: return nil
+        case .effort(let level): return level.rawValue
+        case .thinkingOff: return "thinking:disabled"
+        }
     }
 
     // gpt-5.6: none, low, medium, high, xhigh
@@ -51,10 +57,18 @@ final class OpenAIReasoningTests: XCTestCase {
         XCTAssertEqual(sent("xhigh", to: "o3"), "high")
     }
 
-    func testDeepSeekTakesTheWholeVocabulary() {
-        XCTAssertEqual(sent("off", to: "deepseek-v4-pro", dialect: .deepSeek), "none")
+    // DeepSeek: low, high, max, switched off with its own parameter; the
+    // other names documented as aliases.
+
+    func testDeepSeekHasThreeLevelsAndASwitch() {
+        XCTAssertEqual(sent("off", to: "deepseek-v4-pro", dialect: .deepSeek), "thinking:disabled")
+        XCTAssertEqual(sent("low", to: "deepseek-v4-pro", dialect: .deepSeek), "low")
+        XCTAssertEqual(sent("high", to: "deepseek-v4-pro", dialect: .deepSeek), "high")
         XCTAssertEqual(sent("max", to: "deepseek-v4-pro", dialect: .deepSeek), "max")
-        XCTAssertEqual(sent("xhigh", to: "deepseek-flash", dialect: .deepSeek), "xhigh")
+        // Its own table: medium and xhigh are high.
+        XCTAssertEqual(sent("medium", to: "deepseek-flash", dialect: .deepSeek), "high")
+        XCTAssertEqual(sent("xhigh", to: "deepseek-flash", dialect: .deepSeek), "high")
+        XCTAssertEqual(sent("brief", to: "deepseek-flash", dialect: .deepSeek), "low")
     }
 
     func testSteeredLevelsTranslate() {
@@ -72,8 +86,8 @@ final class OpenAIReasoningTests: XCTestCase {
     func testACallerSpeakingTheAPIsOwnTermsIsTakenAtItsWord() {
         let service = OpenAIService(apiKey: "test")
         let model = Model(id: "gpt-4o", owner: "test")
-        let level = service.reasoningEffort(from: ["reasoning_effort": .string("high")], model: model)
-        XCTAssertEqual(level?.rawValue, "high")
+        let setting = service.reasoning(from: ["reasoning_effort": .string("high")], model: model)
+        XCTAssertEqual(setting, .effort(.high))
     }
 
     func testGenerationIsReadFromTheID() {
@@ -133,6 +147,39 @@ final class OpenAIReasoningFoldTests: XCTestCase {
 
         service.patchMessage(&message, with: try chunk(reasoning: nil, content: "."))
         XCTAssertEqual(text(of: message), "<think>\nWe need\n</think>\n391.")
+    }
+
+    /// DeepSeek's guide: with tools in the request, every assistant message
+    /// carries its reasoning back as `reasoning_content`, and the answer
+    /// alone as content — not the `<think>` fold, which the model never wrote.
+    func testReasoningIsHandedBackToDeepSeekApart() throws {
+        let service = OpenAIService(apiKey: "test", dialect: .deepSeek)
+        var message = Message(role: .assistant)
+        service.patchMessage(&message, with: try chunk(reasoning: "We need", content: nil, role: "assistant"))
+        service.patchMessage(&message, with: try chunk(reasoning: nil, content: "391"))
+        XCTAssertEqual(text(of: message), "<think>\nWe need\n</think>\n391")
+
+        let encoded = service.encodeForTest(messages: [message])
+        XCTAssertEqual(encoded.first?.reasoning_content, "We need")
+        XCTAssertEqual(encoded.first?.content?.first?.text, "391")
+    }
+
+    func testAToolCallRoundHandsBackAnEmptyAnswer() throws {
+        let service = OpenAIService(apiKey: "test", dialect: .deepSeek)
+        var message = Message(role: .assistant)
+        service.patchMessage(&message, with: try chunk(reasoning: "Search first.", content: nil, role: "assistant"))
+        let encoded = service.encodeForTest(messages: [message])
+        XCTAssertEqual(encoded.first?.reasoning_content, "Search first.")
+        XCTAssertEqual(encoded.first?.content?.first?.text, "")
+    }
+
+    func testNothingIsHandedBackToOpenAI() throws {
+        let service = OpenAIService(apiKey: "test", dialect: .openAI)
+        var message = Message(role: .assistant)
+        service.patchMessage(&message, with: try chunk(reasoning: "We need", content: nil, role: "assistant"))
+        service.patchMessage(&message, with: try chunk(reasoning: nil, content: "391"))
+        let encoded = service.encodeForTest(messages: [message])
+        XCTAssertNil(encoded.first?.reasoning_content)
     }
 
     func testAReplyWithoutReasoningIsUntouched() throws {
