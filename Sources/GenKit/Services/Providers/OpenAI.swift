@@ -30,7 +30,17 @@ extension OpenAIService: ChatService {
                 tool_choice: encode(request.toolChoice),
                 verbosity: request.options["verbosity"]?.stringValue.flatMap(OpenAI.ChatRequest.Verbosity.init)
             )
-            let resp = try await client.chatCompletions(req)
+            log(req, streaming: false)
+            let resp: OpenAI.ChatResponse
+            do {
+                resp = try await client.chatCompletions(req)
+            } catch {
+                logger.error("← \(self.hostName, privacy: .public) completion failed: \(error, privacy: .public)")
+                throw error
+            }
+            logger.info(
+                "← \(self.hostName, privacy: .public) completion finished | \(self.describe(resp), privacy: .public)"
+            )
             guard let message = decode(resp) else {
                 throw ChatServiceError.responseError("Missing response choice")
             }
@@ -48,12 +58,88 @@ extension OpenAIService: ChatService {
                 tool_choice: encode(request.toolChoice),
                 verbosity: request.options["verbosity"]?.stringValue.flatMap(OpenAI.ChatRequest.Verbosity.init)
             )
+            log(req, streaming: true)
+
             var message = Message(role: .assistant)
-            for try await resp in try client.chatCompletionsStream(req) {
-                patchMessage(&message, with: resp)
-                try await update(message)
+            var seen: [String: Int] = [:]
+            do {
+                for try await resp in try client.chatCompletionsStream(req) {
+                    tally(resp, into: &seen)
+                    patchMessage(&message, with: resp)
+                    try await update(message)
+                }
+            } catch {
+                logger.error(
+                    "← \(self.hostName, privacy: .public) stream failed after \(self.describe(seen), privacy: .public): \(error, privacy: .public)"
+                )
+                throw error
+            }
+            logger.info("← \(self.hostName, privacy: .public) stream finished | \(self.describe(seen), privacy: .public)")
+        }
+}
+
+// MARK: - Logging
+
+extension OpenAIService {
+
+    /// Who this is talking to. One client serves OpenAI, DeepSeek, Grok, Groq
+    /// and OpenRouter alike, so a line that only said "openai" would name the
+    /// wrong service four times out of five.
+    private var hostName: String {
+        client.host.host() ?? client.host.absoluteString
+    }
+
+    /// What was asked for, in the terms the service was asked in.
+    ///
+    /// Counts and settings only, never the messages: this is for telling why a
+    /// request was refused, and a conversation's contents don't answer that.
+    private func log(_ req: OpenAI.ChatRequest, streaming: Bool) {
+        logger.info("""
+            → \(self.hostName, privacy: .public) \(streaming ? "stream" : "completion", privacy: .public) \
+            | model: \(req.model, privacy: .public) \
+            | reasoning_effort: \(req.reasoning_effort?.rawValue ?? "unset", privacy: .public) \
+            | verbosity: \(req.verbosity?.rawValue ?? "unset", privacy: .public) \
+            | max_completion_tokens: \(req.max_completion_tokens.map { "\($0)" } ?? "unset", privacy: .public) \
+            | temperature: \(req.temperature.map { "\($0)" } ?? "unset", privacy: .public) \
+            | tools: \(req.tools?.count ?? 0, privacy: .public) \
+            | messages: \(req.messages.count, privacy: .public)
+            """)
+    }
+
+    /// What a stream's chunk carried, by kind, so a failure can say how far
+    /// the reply had got and what it had received by then. The first
+    /// `keyNotFound` from DeepSeek arrived on the last chunk of a complete
+    /// answer, and nothing said so.
+    private func tally(_ resp: OpenAI.ChatStreamResponse, into seen: inout [String: Int]) {
+        seen["chunks", default: 0] += 1
+        for choice in resp.choices {
+            if choice.delta.content != nil { seen["content", default: 0] += 1 }
+            if choice.delta.tool_calls != nil { seen["tool_calls", default: 0] += 1 }
+            if choice.delta.refusal != nil { seen["refusal", default: 0] += 1 }
+            if let reason = choice.finish_reason { seen["finish:\(reason)", default: 0] += 1 }
+        }
+        if resp.usage != nil { seen["usage", default: 0] += 1 }
+    }
+
+    private func describe(_ seen: [String: Int]) -> String {
+        guard !seen.isEmpty else { return "no chunks" }
+        return seen
+            .sorted { $0.key < $1.key }
+            .map { "\($0.key)×\($0.value)" }
+            .joined(separator: " ")
+    }
+
+    private func describe(_ resp: OpenAI.ChatResponse) -> String {
+        var parts = ["choices×\(resp.choices.count)"]
+        if let reason = resp.choices.first?.finish_reason { parts.append("finish:\(reason)") }
+        if let usage = resp.usage {
+            parts.append("tokens: \(usage.prompt_tokens ?? 0) in, \(usage.completion_tokens ?? 0) out")
+            if let reasoning = usage.completion_tokens_details?.reasoning_tokens {
+                parts.append("reasoning: \(reasoning)")
             }
         }
+        return parts.joined(separator: " ")
+    }
 }
 
 extension OpenAIService: EmbeddingService {
