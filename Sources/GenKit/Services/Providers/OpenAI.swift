@@ -260,6 +260,14 @@ extension OpenAIService {
             if id.hasPrefix("o1-mini") || id.hasPrefix("o1-preview") {
                 return Reasoning(levels: nil)
             }
+
+            // The search models — gpt-4o-search-preview, gpt-5-search-api —
+            // are chat models with search built in and no reasoning setting:
+            // gpt-5-search-api refuses the parameter outright, "Unrecognized
+            // request argument", whatever its generation number says.
+            if id.split(separator: "-").contains("search") {
+                return Reasoning(levels: nil)
+            }
             if let first = id.first, first == "o", id.dropFirst().first?.isNumber == true {
                 return Reasoning(levels: ["low", "medium", "high"])
             }

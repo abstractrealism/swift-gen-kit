@@ -44,7 +44,10 @@ final class OpenAIReasoningTests: XCTestCase {
     // gpt-4o: refuses the parameter
 
     func testModelsThatDoNotReasonAreSentNothing() {
-        for id in ["gpt-4o", "gpt-4o-mini", "gpt-4.1", "gpt-3.5-turbo", "chatgpt-4o-latest", "o1-mini"] {
+        // gpt-5-search-api refused reasoning_effort outright — "Unrecognized
+        // request argument" — whatever its generation number suggests.
+        for id in ["gpt-4o", "gpt-4o-mini", "gpt-4.1", "gpt-3.5-turbo", "chatgpt-4o-latest", "o1-mini",
+                   "gpt-5-search-api", "gpt-4o-search-preview", "gpt-4o-mini-search-preview"] {
             XCTAssertNil(sent("high", to: id), id)
             XCTAssertNil(sent("off", to: id), id)
         }
@@ -88,6 +91,16 @@ final class OpenAIReasoningTests: XCTestCase {
         let model = Model(id: "gpt-4o", owner: "test")
         let setting = service.reasoning(from: ["reasoning_effort": .string("high")], model: model)
         XCTAssertEqual(setting, .effort(.high))
+    }
+
+    func testSearchModelsSearchByThemselves() {
+        let openAI = Service(kind: .openAI, name: "OpenAI")
+        for id in ["gpt-5-search-api", "gpt-4o-search-preview", "gpt-4o-mini-search-preview"] {
+            XCTAssertTrue(openAI.hasBuiltInWebSearch(modelID: id), id)
+        }
+        for id in ["gpt-5", "gpt-4o", "text-search-ada-doc-001"] {
+            XCTAssertFalse(openAI.hasBuiltInWebSearch(modelID: id), id)
+        }
     }
 
     func testGenerationIsReadFromTheID() {
