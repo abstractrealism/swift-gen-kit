@@ -122,9 +122,13 @@ extension Service {
     public func hasBuiltInWebSearch(modelID: String) -> Bool {
         switch kind {
         case .openAI:
-            modelID.lowercased().contains("search-preview")
+            // A `search` component on a GPT model: the preview pair, and
+            // gpt-5-search-api after them. Not the legacy `text-search-…`
+            // embeddings, which aren't chat models at all.
+            let id = modelID.lowercased()
+            return id.hasPrefix("gpt-") && id.split(separator: "-").contains("search")
         default:
-            false
+            return false
         }
     }
 
