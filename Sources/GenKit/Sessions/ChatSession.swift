@@ -1,5 +1,8 @@
 import Foundation
+import OSLog
 import SharedKit
+
+private let logger = Logger(subsystem: "ChatSession", category: "GenKit")
 
 public class ChatSession {
     public static let shared = ChatSession()
@@ -77,6 +80,7 @@ public class ChatSession {
                         }
                         var (toolMessages, shouldContinue) = try await processToolCalls(in: lastMessage, callback: request.toolCallback, maxConcurrent: maxConcurrentToolCalls)
                         runLoopCount += 1
+                        logger.info("tool round \(runLoopCount, privacy: .public) of \(runLoopLimit, privacy: .public): \(lastMessage.toolCalls?.count ?? 0, privacy: .public) calls answered, \(runLoopLimit - runLoopCount, privacy: .public) replies left")
                         countDown(in: &toolMessages, repliesLeft: runLoopLimit - runLoopCount, from: countdownFrom)
                         for message in toolMessages {
                             let message = apply(runID: runID, message: message)
@@ -139,6 +143,7 @@ public class ChatSession {
                 break
             }
             var (toolMessages, shouldContinue) = try await processToolCalls(in: message, callback: request.toolCallback, maxConcurrent: maxConcurrentToolCalls)
+            logger.info("tool round \(runLoopCount + 1, privacy: .public) of \(runLoopLimit, privacy: .public): \(message.toolCalls?.count ?? 0, privacy: .public) calls answered, \(runLoopLimit - runLoopCount - 1, privacy: .public) replies left")
             countDown(in: &toolMessages, repliesLeft: runLoopLimit - (runLoopCount + 1), from: countdownFrom)
             for message in toolMessages {
                 let message = apply(runID: runID, message: message)
@@ -173,6 +178,7 @@ public class ChatSession {
             let rounds = repliesLeft - 1
             notice = "Note: \(repliesLeft) replies remain in this turn, including your final answer. You may call tools \(rounds) more \(rounds == 1 ? "time" : "times"), then you must answer with what you have."
         }
+        logger.info("countdown: told the model \(repliesLeft, privacy: .public) \(repliesLeft == 1 ? "reply remains" : "replies remain", privacy: .public)")
         let index = toolMessages.count - 1
         var last = toolMessages[index]
         if let contents = last.contents, let textIndex = contents.lastIndex(where: { if case .text = $0 { true } else { false } }),
