@@ -33,7 +33,7 @@ public class ChatSession {
         }
     }
 
-    public func stream(_ request: ChatSessionRequest, runLoopLimit: Int = 10, maxConcurrentToolCalls: Int = 3, timeouts: RoundTimeouts = .none) -> AsyncThrowingStream<Message, Error> {
+    public func stream(_ request: ChatSessionRequest, runLoopLimit: Int = 10, maxConcurrentToolCalls: Int = 3, timeouts: RoundTimeouts = .none, countdownFrom: Int = 3) -> AsyncThrowingStream<Message, Error> {
         AsyncThrowingStream { continuation in
             let task = Task {
                 do {
@@ -75,14 +75,15 @@ public class ChatSession {
                         guard (lastMessage.toolCalls?.count ?? 0) > 0 else {
                             break
                         }
-                        let (toolMessages, shouldContinue) = try await processToolCalls(in: lastMessage, callback: request.toolCallback, maxConcurrent: maxConcurrentToolCalls)
+                        var (toolMessages, shouldContinue) = try await processToolCalls(in: lastMessage, callback: request.toolCallback, maxConcurrent: maxConcurrentToolCalls)
+                        runLoopCount += 1
+                        countDown(in: &toolMessages, repliesLeft: runLoopLimit - runLoopCount, from: countdownFrom)
                         for message in toolMessages {
                             let message = apply(runID: runID, message: message)
                             messages = apply(message: message, messages: messages)
                             continuation.yield(message)
                         }
                         runShouldContinue = shouldContinue
-                        runLoopCount += 1
                     }
                     continuation.finish()
                 } catch {
@@ -99,7 +100,7 @@ public class ChatSession {
         }
     }
 
-    public func completion(_ request: ChatSessionRequest, runLoopLimit: Int = 10, maxConcurrentToolCalls: Int = 3, timeouts: RoundTimeouts = .none) async throws -> ChatSessionResponse {
+    public func completion(_ request: ChatSessionRequest, runLoopLimit: Int = 10, maxConcurrentToolCalls: Int = 3, timeouts: RoundTimeouts = .none, countdownFrom: Int = 3) async throws -> ChatSessionResponse {
         let runID = String.id
 
         var messages = request.messages
@@ -137,7 +138,8 @@ public class ChatSession {
             guard (message.toolCalls?.count ?? 0) > 0 else {
                 break
             }
-            let (toolMessages, shouldContinue) = try await processToolCalls(in: message, callback: request.toolCallback, maxConcurrent: maxConcurrentToolCalls)
+            var (toolMessages, shouldContinue) = try await processToolCalls(in: message, callback: request.toolCallback, maxConcurrent: maxConcurrentToolCalls)
+            countDown(in: &toolMessages, repliesLeft: runLoopLimit - (runLoopCount + 1), from: countdownFrom)
             for message in toolMessages {
                 let message = apply(runID: runID, message: message)
                 response.messages = apply(message: message, messages: response.messages)
@@ -148,6 +150,38 @@ public class ChatSession {
         }
 
         return response
+    }
+
+    /// Tells the model, in its tool results, how many replies it has left.
+    ///
+    /// The run-loop limit is a hard stop: a model still calling tools when
+    /// it's reached gets an error, not an answer, and a hard question can
+    /// take a model that many rounds — one measured turn found its answer
+    /// by round eight and was still verifying at ten. Told the count, it
+    /// can conclude instead. Said once the remaining replies are down to
+    /// `countdownFrom` (three: a warning, a last chance, and the answer),
+    /// on the last tool result of the round so it's the freshest thing the
+    /// model reads. Appended to the result rather than sent as a message of
+    /// its own, since not every provider allows a message between a tool
+    /// result and the reply to it.
+    private func countDown(in toolMessages: inout [Message], repliesLeft: Int, from countdownFrom: Int) {
+        guard countdownFrom > 0, repliesLeft <= countdownFrom, repliesLeft >= 1, !toolMessages.isEmpty else { return }
+        let notice: String
+        if repliesLeft == 1 {
+            notice = "Note: this is the last set of tool results for this turn. Reply now with your answer, using what you have — any further tool calls will not be answered."
+        } else {
+            let rounds = repliesLeft - 1
+            notice = "Note: \(repliesLeft) replies remain in this turn, including your final answer. You may call tools \(rounds) more \(rounds == 1 ? "time" : "times"), then you must answer with what you have."
+        }
+        let index = toolMessages.count - 1
+        var last = toolMessages[index]
+        if let contents = last.contents, let textIndex = contents.lastIndex(where: { if case .text = $0 { true } else { false } }),
+           case .text(let text) = contents[textIndex] {
+            last.contents![textIndex] = .text(text + "\n\n" + notice)
+        } else {
+            last.contents = (last.contents ?? []) + [.text(notice)]
+        }
+        toolMessages[index] = last
     }
 
     /// One round's stream, given up on if nothing has arrived within `limit`.
