@@ -56,7 +56,7 @@ public class ChatSession {
                         // cause an expensive infinite loop of tool calls.
                         let req = ChatServiceRequest(
                             model: request.model,
-                            messages: messages,
+                            messages: request.prepared(messages),
                             tools: request.tools,
                             toolChoice: (runLoopCount > 0) ? nil : request.tool, // FIRST REQUEST ONLY
                             options: request.options
@@ -122,7 +122,7 @@ public class ChatSession {
             // cause an expensive infinite loop of tool calls.
             let req = ChatServiceRequest(
                 model: request.model,
-                messages: messages,
+                messages: request.prepared(messages),
                 tools: request.tools,
                 toolChoice: (runLoopCount > 0) ? nil : request.tool, // FIRST REQUEST ONLY
                 options: request.options
@@ -321,6 +321,19 @@ public class ChatSession {
 public struct ChatSessionRequest {
     public typealias ToolCallback = @Sendable (ToolCall) async throws -> ToolCallResponse
 
+    /// Last word on what a round's request carries, given everything the
+    /// turn has accumulated so far — the history handed in plus every reply
+    /// and tool result since. What it returns is what's sent; what the
+    /// session keeps and yields is untouched.
+    ///
+    /// The session builds each round from the whole turn, and a turn that
+    /// searches grows by thousands of tokens a round: every search's
+    /// results, every reply's reasoning, all re-read by the model before it
+    /// can say a word. Which of that is still worth sending is the caller's
+    /// call — it knows the provider and the setting — so it's a hook here
+    /// rather than a policy.
+    public typealias HistoryPreparer = @Sendable ([Message]) -> [Message]
+
     public let service: ChatService
     public let model: Model
     public let toolCallback: ToolCallback?
@@ -331,6 +344,7 @@ public struct ChatSessionRequest {
     public private(set) var tool: Tool? = nil
     public private(set) var context: [String: Value] = [:]
     public private(set) var options: [String: Value] = [:]
+    public private(set) var prepareHistory: HistoryPreparer? = nil
 
     public init(service: ChatService, model: Model, toolCallback: ToolCallback? = nil) {
         self.service = service
@@ -365,6 +379,22 @@ public struct ChatSessionRequest {
 
     public mutating func with(option key: String, value: Value) {
         options[key] = value
+    }
+
+    public mutating func with(prepareHistory: HistoryPreparer?) {
+        self.prepareHistory = prepareHistory
+    }
+
+    /// The messages to send this round: the turn so far, prepared.
+    ///
+    /// The system message is set aside first and put back after, so the
+    /// preparer sees exactly the conversation — what a caller thinks of as
+    /// history — and can't lose the prompt by accident.
+    func prepared(_ messages: [Message]) -> [Message] {
+        guard let prepareHistory else { return messages }
+        let system = messages.prefix { $0.role == .system }
+        let rest = messages.dropFirst(system.count)
+        return Array(system) + prepareHistory(Array(rest))
     }
 
     var messages: [Message] {
