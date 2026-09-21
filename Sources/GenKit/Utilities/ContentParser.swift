@@ -45,7 +45,7 @@ public final class ContentParser {
     private init() {}
 
     public func parse(input: String, tags: [String] = []) throws -> Result {
-        let matches = input.ranges(of: tagPattern.dotMatchesNewlines())
+        let pattern = tagPattern.dotMatchesNewlines()
         var contents: [Result.Content] = []
         var positionIndex = input.startIndex
 
@@ -59,35 +59,45 @@ public final class ContentParser {
             }
         }
 
-        for range in matches {
+        // One match at a time from where the last left off, rather than every
+        // match up front: how far a match reaches depends on whether its tag
+        // is one that was asked for, so where the next search starts isn't
+        // known until this one has been looked at.
+        while positionIndex < input.endIndex, let match = input[positionIndex...].firstMatch(of: pattern) {
+            let range = match.range
+            let name = String(match.output.name)
+
+            guard tags.isEmpty || tags.contains(name) else {
+                // Not a tag anyone asked for — HTML or JSX in an answer, a
+                // generic like `Array<Int>`, an autolink. It's text, and it
+                // has to stay in one piece with the text around it: split
+                // off, each piece is read as markdown on its own, and a code
+                // block that spans the split is cut in two. And what the
+                // match took to be the tag's content may hold a tag that *is*
+                // wanted — an autolink has no closing tag, so its match ran
+                // to the end of the message and hid everything after it — so
+                // only the opening `<…>` is passed over, and the search goes
+                // on from just after it. The opening tag ends at the first
+                // `>`; neither the name nor its attributes can contain one.
+                let openingEnd = input[range].firstIndex(of: ">").map { input.index(after: $0) } ?? range.upperBound
+                appendToContent(String(input[positionIndex..<openingEnd]))
+                positionIndex = openingEnd
+                continue
+            }
 
             // Add text before the tag if there's any
             if positionIndex < range.lowerBound {
-                let textRange = positionIndex..<range.lowerBound
-                let text = String(input[textRange])
-                contents.append(.text(text))
+                appendToContent(String(input[positionIndex..<range.lowerBound]))
             }
 
-            // Extract tag information
-            let match = input[range]
-            if let output = try? tagPattern.dotMatchesNewlines().wholeMatch(in: match)?.output {
-                let name = String(output.name)
-                let content = String(output.content)
-                let params = try parseTagParams(output.params)
+            let content = String(match.output.content)
+            let params = try parseTagParams(match.output.params)
 
-                // Determine if the tag has a closing element by checking the captured closing group
-                let closingTag = String(output.closing)
-                let hasClosingTag = closingTag.starts(with: "</") && closingTag.contains(name)
+            // Determine if the tag has a closing element by checking the captured closing group
+            let closingTag = String(match.output.closing)
+            let hasClosingTag = closingTag.starts(with: "</") && closingTag.contains(name)
 
-                if tags.isEmpty || tags.contains(name) {
-                    contents.append(.tag(.init(name: name, content: content, params: params, hasClosingTag: hasClosingTag)))
-                } else {
-                    let text = String(match)
-                    appendToContent(text)
-                }
-            }
-
-            // Update position index
+            contents.append(.tag(.init(name: name, content: content, params: params, hasClosingTag: hasClosingTag)))
             positionIndex = range.upperBound
         }
 
