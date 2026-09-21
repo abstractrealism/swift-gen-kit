@@ -231,10 +231,17 @@ extension Service {
         }
     }
 
+    // A client doesn't depend on a preferred model, so none of these ask for
+    // one. They used to — each began by refusing unless its preference was
+    // set — which made the preference a condition of using the service at
+    // all, rather than the default a caller falls back on. A caller that has
+    // chosen a model itself, as a conversation pinned to one does, was
+    // refused a client for a service it had every right to use, and refused
+    // with "missing service", the one thing that wasn't missing. The model is
+    // the caller's to supply in each request; whether a service does this
+    // kind of work at all is what the switches below answer.
+
     public func chatService(session: URLSession?) throws -> ChatService {
-        guard preferredChatModel != nil else {
-            throw ServiceError.missingService
-        }
         switch kind {
         case .anthropic:
             return anthropic(session: session)
@@ -258,9 +265,6 @@ extension Service {
     }
 
     public func imageService(session: URLSession?) throws -> ImageService {
-        guard preferredImageModel != nil else {
-            throw ServiceError.missingService
-        }
         switch kind {
         case .fal:
             return fal(session: session)
@@ -272,9 +276,6 @@ extension Service {
     }
 
     public func embeddingService(session: URLSession?) throws -> EmbeddingService {
-        guard preferredEmbeddingModel != nil else {
-            throw ServiceError.missingService
-        }
         switch kind {
         case .groq:
             return groq(session: session)
@@ -292,9 +293,6 @@ extension Service {
     }
 
     public func transcriptionService(session: URLSession?) throws -> TranscriptionService {
-        guard preferredTranscriptionModel != nil else {
-            throw ServiceError.missingService
-        }
         switch kind {
         case .groq:
             return groq(session: session)
@@ -306,9 +304,6 @@ extension Service {
     }
 
     public func speechService(session: URLSession?) throws -> SpeechService {
-        guard preferredSpeechModel != nil else {
-            throw ServiceError.missingService
-        }
         switch kind {
         case .elevenLabs:
             return elevenLabs(session: session)
@@ -324,9 +319,6 @@ extension Service {
     }
 
     public func summarizationService(session: URLSession?) throws -> ChatService {
-        guard preferredChatModel != nil else {
-            throw ServiceError.missingService
-        }
         switch kind {
         case .anthropic:
             return anthropic(session: session)
