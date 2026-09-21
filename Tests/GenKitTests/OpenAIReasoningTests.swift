@@ -83,7 +83,39 @@ final class OpenAIReasoningTests: XCTestCase {
 
     func testUnmeasuredDialectsAreSentNothing() {
         XCTAssertNil(sent("high", to: "grok-4", dialect: .grok))
-        XCTAssertNil(sent("high", to: "openai/gpt-oss-120b", dialect: .groq))
+        XCTAssertNil(sent("high", to: "openai/gpt-oss-120b", dialect: .openRouter))
+        // Groq's Llama and MiniMax rows are unmeasured too.
+        XCTAssertNil(sent("high", to: "llama-3.3-70b-versatile", dialect: .groq))
+        XCTAssertNil(sent("off", to: "minimaxai/minimax-m2.7", dialect: .groq))
+    }
+
+    // Groq, from its API reference. Ids carry the lab as a prefix.
+
+    func testGroqGPTOSSHasThreeLevelsAndNoOff() {
+        XCTAssertEqual(sent("low", to: "openai/gpt-oss-120b", dialect: .groq), "low")
+        XCTAssertEqual(sent("medium", to: "openai/gpt-oss-20b", dialect: .groq), "medium")
+        XCTAssertEqual(sent("high", to: "openai/gpt-oss-120b", dialect: .groq), "high")
+        XCTAssertEqual(sent("xhigh", to: "openai/gpt-oss-120b", dialect: .groq), "high")
+        // Can't be told none, so Off asks for the least.
+        XCTAssertEqual(sent("off", to: "openai/gpt-oss-120b", dialect: .groq), "low")
+        XCTAssertEqual(sent("brief", to: "openai/gpt-oss-120b", dialect: .groq), "low")
+        XCTAssertNil(sent("full", to: "openai/gpt-oss-120b", dialect: .groq))
+    }
+
+    func testGroqQwen38TakesNoneAndThreeLevels() {
+        XCTAssertEqual(sent("off", to: "qwen/qwen3.8-27b", dialect: .groq), "none")
+        XCTAssertEqual(sent("low", to: "qwen/qwen3.8-27b", dialect: .groq), "low")
+        XCTAssertEqual(sent("high", to: "qwen/qwen3.8-27b", dialect: .groq), "high")
+        XCTAssertEqual(sent("max", to: "qwen/qwen3.8-27b", dialect: .groq), "high")
+    }
+
+    /// The older qwen3 models take `none` and nothing else — a switch, not
+    /// a scale. Asking for some reasoning must not be rounded down to none.
+    func testAGradedRequestIsNeverRoundedDownToNone() {
+        XCTAssertEqual(sent("off", to: "qwen/qwen3-32b", dialect: .groq), "none")
+        XCTAssertNil(sent("low", to: "qwen/qwen3-32b", dialect: .groq))
+        XCTAssertNil(sent("high", to: "qwen/qwen3-32b", dialect: .groq))
+        XCTAssertNil(sent("brief", to: "qwen/qwen3-32b", dialect: .groq))
     }
 
     func testACallerSpeakingTheAPIsOwnTermsIsTakenAtItsWord() {
@@ -117,6 +149,9 @@ final class OpenAIReasoningTests: XCTestCase {
         XCTAssertEqual(OpenAIService.canDisableThinking(modelID: "o3", dialect: .openAI), false)
         XCTAssertNil(OpenAIService.canDisableThinking(modelID: "gpt-4o", dialect: .openAI))
         XCTAssertEqual(OpenAIService.canDisableThinking(modelID: "deepseek-flash", dialect: .deepSeek), true)
+        XCTAssertEqual(OpenAIService.canDisableThinking(modelID: "openai/gpt-oss-120b", dialect: .groq), false)
+        XCTAssertEqual(OpenAIService.canDisableThinking(modelID: "qwen/qwen3.8-27b", dialect: .groq), true)
+        XCTAssertNil(OpenAIService.canDisableThinking(modelID: "llama-3.3-70b-versatile", dialect: .groq))
     }
 }
 
@@ -126,10 +161,10 @@ final class OpenAIReasoningTests: XCTestCase {
 /// with `content` null, then the answer with `reasoning_content` gone.
 final class OpenAIReasoningFoldTests: XCTestCase {
 
-    private func chunk(reasoning: String?, content: String?, role: String? = nil) throws -> OpenAI.ChatStreamResponse {
+    private func chunk(reasoning: String?, content: String?, role: String? = nil, field: String = "reasoning_content") throws -> OpenAI.ChatStreamResponse {
         var delta: [String: Any] = [:]
         delta["content"] = content ?? NSNull()
-        if let reasoning { delta["reasoning_content"] = reasoning }
+        if let reasoning { delta[field] = reasoning }
         if let role { delta["role"] = role }
         let json: [String: Any] = [
             "id": "x", "object": "chat.completion.chunk", "created": 1, "model": "deepseek-flash",
@@ -165,6 +200,23 @@ final class OpenAIReasoningFoldTests: XCTestCase {
     /// DeepSeek's guide: with tools in the request, every assistant message
     /// carries its reasoning back as `reasoning_content`, and the answer
     /// alone as content — not the `<think>` fold, which the model never wrote.
+    /// Groq's gpt-oss models stream the same thing as `reasoning`, and so
+    /// does OpenRouter. Folded identically; nothing about the fold is
+    /// DeepSeek's but the field name.
+    func testReasoningUnderGroqsNameFoldsTheSameWay() throws {
+        let service = OpenAIService(apiKey: "test", dialect: .groq)
+        var message = Message(role: .assistant)
+
+        service.patchMessage(&message, with: try chunk(reasoning: "17 times", content: nil, role: "assistant", field: "reasoning"))
+        service.patchMessage(&message, with: try chunk(reasoning: " 23", content: nil, field: "reasoning"))
+        XCTAssertEqual(text(of: message), "<think>\n17 times 23", "left open while reasoning streams")
+
+        service.patchMessage(&message, with: try chunk(reasoning: nil, content: "391"))
+        XCTAssertEqual(text(of: message), "<think>\n17 times 23\n</think>\n391")
+        XCTAssertEqual(message.metadata["thinking"]?.stringValue, "17 times 23")
+        XCTAssertEqual(message.metadata["answer"]?.stringValue, "391")
+    }
+
     func testReasoningIsHandedBackToDeepSeekApart() throws {
         let service = OpenAIService(apiKey: "test", dialect: .deepSeek)
         var message = Message(role: .assistant)

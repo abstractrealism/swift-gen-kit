@@ -178,12 +178,21 @@ extension OpenAIService {
         // Not offered, so the nearest that is: `xhigh` on a model that stops
         // at `high` gets `high`; `none` on a model that can't stop gets the
         // least it will do. Ties go to the lower level.
+        //
+        // Never the other way round. Asking for some reasoning and getting
+        // none is not "nearest", it's the opposite of what was asked — and
+        // a model whose only level is `none` (Groq's qwen3 family) reasons
+        // by default, so leaving it alone is what a graded request means.
         let order = Reasoning.order
         guard let target = order.firstIndex(of: wanted) else { return .nothing }
-        let nearest = levels
+        let candidates = wanted == "none" ? levels : levels.filter { $0 != "none" }
+        let nearest = candidates
             .compactMap { level in order.firstIndex(of: level).map { (level, abs($0 - target)) } }
             .min { $0.1 < $1.1 }?.0
-        guard let nearest, let level = OpenAI.ChatRequest.ReasoningEffort(rawValue: nearest) else { return .nothing }
+        guard let nearest, let level = OpenAI.ChatRequest.ReasoningEffort(rawValue: nearest) else {
+            logger.info("\(model.id, privacy: .public) has no level for \(wanted, privacy: .public); leaving it to the model")
+            return .nothing
+        }
 
         if wanted == "none" {
             logger.info(
@@ -226,9 +235,20 @@ extension OpenAIService {
     /// xhigh are high. It is switched off with its own `thinking` parameter,
     /// not a level; thinking is on by default at high. The o-series row is
     /// from the documentation too, and `o1-mini` and `o1-preview` are
-    /// documented as taking none. Grok, Groq and OpenRouter are unmeasured
-    /// and get nothing, which is the safe failure: a level not sent is the
-    /// model's default, where a level refused is no answer at all.
+    /// documented as taking none.
+    ///
+    /// Groq is from its API reference, which is per model family:
+    ///
+    ///     openai/gpt-oss-*   low, medium, high (medium by default; no none)
+    ///     qwen/qwen3.8-*     none, low, medium, high (none by default;
+    ///                        high is the model's own xhigh)
+    ///     other qwen3        none, or the model's default
+    ///
+    /// and "values outside a model's supported set are rejected with a 400".
+    /// Anything else there — Llama, MiniMax — is unmeasured. Grok and
+    /// OpenRouter are unmeasured throughout and get nothing, which is the
+    /// safe failure: a level not sent is the model's default, where a level
+    /// refused is no answer at all.
     struct Reasoning {
         /// Ascending. Nil where the model takes no such setting.
         let levels: [String]?
@@ -251,7 +271,22 @@ extension OpenAIService {
                     aliases: ["minimal": "low", "medium": "high", "xhigh": "high"],
                     offSwitch: true
                 )
-            case .grok, .groq, .openRouter:
+            case .groq:
+                // Ids carry the lab as a prefix: openai/gpt-oss-120b,
+                // qwen/qwen3.8-27b. The family is what's after it.
+                let family = id.split(separator: "/").last.map(String.init) ?? id
+                if family.hasPrefix("gpt-oss") {
+                    return Reasoning(levels: ["low", "medium", "high"])
+                }
+                if family.hasPrefix("qwen3.8") {
+                    return Reasoning(levels: ["none", "low", "medium", "high"])
+                }
+                if family.hasPrefix("qwen3") {
+                    // A switch, not a scale: none, or leave it to the model.
+                    return Reasoning(levels: ["none"])
+                }
+                return Reasoning(levels: nil)
+            case .grok, .openRouter:
                 return Reasoning(levels: nil)
             case .openAI:
                 break
@@ -336,6 +371,10 @@ extension OpenAIService {
         seen["chunks", default: 0] += 1
         for choice in resp.choices {
             if choice.delta.content != nil { seen["content", default: 0] += 1 }
+            // Counted under the name each arrived by, so the line says which
+            // endpoint's convention was seen — not just that reasoning was.
+            if choice.delta.reasoning_content != nil { seen["reasoning_content", default: 0] += 1 }
+            if choice.delta.reasoning != nil { seen["reasoning", default: 0] += 1 }
             if choice.delta.tool_calls != nil { seen["tool_calls", default: 0] += 1 }
             if choice.delta.refusal != nil { seen["refusal", default: 0] += 1 }
             if let reason = choice.finish_reason { seen["finish:\(reason)", default: 0] += 1 }
@@ -642,7 +681,8 @@ extension OpenAIService {
 
     private func decode(_ resp: OpenAI.ChatResponse) -> Message? {
         guard let choice = resp.choices.first else { return nil }
-        let reasoning = choice.message.reasoning_content ?? ""
+        // Two names for one thing, never both: DeepSeek's and Groq's.
+        let reasoning = choice.message.reasoning_content ?? choice.message.reasoning ?? ""
         let text = reasoning.isEmpty
             ? choice.message.content
             : compose(thinking: reasoning, answer: choice.message.content ?? "")
@@ -733,8 +773,9 @@ extension OpenAIService {
         // characters at a time with `content` null, then the reverse. So each
         // is accumulated and the combined content rebuilt from both every
         // time, as the Ollama provider does.
-        if choice.delta.reasoning_content != nil || message.metadata["thinking"] != nil {
-            let thinking = (message.metadata["thinking"]?.stringValue ?? "") + (choice.delta.reasoning_content ?? "")
+        let reasoningDelta = choice.delta.reasoning_content ?? choice.delta.reasoning
+        if reasoningDelta != nil || message.metadata["thinking"] != nil {
+            let thinking = (message.metadata["thinking"]?.stringValue ?? "") + (reasoningDelta ?? "")
             let answer = (message.metadata["answer"]?.stringValue ?? "") + (choice.delta.content ?? "")
 
             message.metadata["thinking"] = .string(thinking)
