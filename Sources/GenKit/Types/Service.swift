@@ -201,6 +201,8 @@ extension Service {
             OpenAIService.canDisableThinking(modelID: modelID, dialect: .openAI)
         case .deepseek:
             OpenAIService.canDisableThinking(modelID: modelID, dialect: .deepSeek)
+        case .groq:
+            OpenAIService.canDisableThinking(modelID: modelID, dialect: .groq)
         default:
             nil
         }
