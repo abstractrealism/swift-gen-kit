@@ -735,8 +735,13 @@ extension OpenAIService {
         }
         // Reasoning is part of what was generated and is counted in the
         // output, so it's kept as a share of it rather than added on.
+        //
+        // Under its own name, not `thinkingTokens`: that one is a caller's
+        // estimate for services that report no such figure, apportioned from
+        // where the reasoning ended in the stream. A counted number and a
+        // guess shouldn't share a key, or whichever is written second wins.
         if let reasoning = usage.completion_tokens_details?.reasoning_tokens, reasoning > 0 {
-            message.metadata["thinkingTokens"] = .int(reasoning)
+            message.metadata["reasoningTokens"] = .int(reasoning)
         }
     }
     

@@ -50,7 +50,8 @@ final class OpenAIUsageRecordingTests: XCTestCase {
         service.patchMessage(&message, with: try chunk(Self.usageOnlyChunk))
         XCTAssertEqual(message.metadata["inputTokens"]?.intValue, 20)
         XCTAssertEqual(message.metadata["outputTokens"]?.intValue, 30)
-        XCTAssertEqual(message.metadata["thinkingTokens"]?.intValue, 12)
+        XCTAssertEqual(message.metadata["reasoningTokens"]?.intValue, 12, "the counted figure, not the caller's estimate")
+        XCTAssertNil(message.metadata["thinkingTokens"])
         // No timings outside Groq, so no rate is claimed.
         XCTAssertNil(message.metadata["outputSeconds"])
     }
