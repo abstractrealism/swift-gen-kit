@@ -445,12 +445,40 @@ extension AnthropicService {
 extension AnthropicService {
 
     private func decode(_ resp: Anthropic.ChatResponse) -> Message {
-        Message(
+        var message = Message(
             role: decode(resp.role) ?? .assistant,
             contents: resp.content?.compactMap { decode($0) } ?? [],
             toolCalls: resp.content?.compactMap { decodeToolCall($0) },
             finishReason: decode(resp.stop_reason)
         )
+        record(usage: resp.usage, model: resp.model, into: &message)
+        return message
+    }
+
+    /// What the reply cost, under the provider-neutral names the Ollama
+    /// provider uses. Nothing recorded this before, so an app showing what a
+    /// generation cost showed nothing on every service but Ollama.
+    ///
+    /// Each field is written only when it arrives: a stream reports the
+    /// input count on its first event and the output count on a later one,
+    /// and this runs on every event in between.
+    nonisolated func record(usage: Anthropic.ChatResponse.Usage?, model: String?, into message: inout Message) {
+        if let model, !model.isEmpty {
+            message.metadata["model"] = .string(model)
+        }
+        guard let usage else { return }
+
+        // Cached reads and writes are prompt tokens billed differently, not
+        // extra ones, but `input_tokens` counts neither — so a cached turn
+        // reported a fraction of what it actually sent.
+        let input = [usage.input_tokens, usage.cache_read_input_tokens, usage.cache_creation_input_tokens]
+            .compactMap { $0 }
+        if !input.isEmpty {
+            message.metadata["inputTokens"] = .int(input.reduce(0, +))
+        }
+        if let output = usage.output_tokens {
+            message.metadata["outputTokens"] = .int(output)
+        }
     }
 
     private func decode(_ role: Anthropic.ChatResponse.Role?) -> Message.Role? {
@@ -482,7 +510,7 @@ extension AnthropicService {
         }
     }
 
-    private func decode(_ reason: Anthropic.ChatResponse.StopReason?) -> Message.FinishReason? {
+    nonisolated func decode(_ reason: Anthropic.ChatResponse.StopReason?) -> Message.FinishReason? {
         guard let reason else { return nil }
         switch reason {
         case .end_turn:
@@ -530,7 +558,7 @@ extension AnthropicService {
     /// stops without answering keeps an open tag, which readers already handle
     /// — an unterminated block runs to the end of the text, which is exactly
     /// what an interrupted reply is.
-    private func closeThinking(_ message: inout Message) {
+    nonisolated private func closeThinking(_ message: inout Message) {
         guard case .text(let existing) = message.contents?.last,
               existing.hasPrefix("<think>"),
               !existing.contains("</think>")
@@ -540,17 +568,34 @@ extension AnthropicService {
         message.contents![message.contents!.count-1] = .text(existing + "\n</think>")
     }
 
-    private func patchMessage(_ message: inout Message, with resp: ChatResponseStream) {
+    nonisolated func patchMessage(_ message: inout Message, with resp: ChatResponseStream) {
+        // Before the switch, because the events carrying usage are among
+        // those it returns from: the opening one reports what the prompt
+        // cost, and `message_delta` the running output count.
+        record(usage: resp.message?.usage ?? resp.usage, model: resp.message?.model, into: &message)
+
         switch resp.type {
-        case .ping, .message_delta, .content_block_stop:
+        case .ping, .content_block_stop:
             return
+        case .message_delta:
+            // Where a stream says why the model stopped. Read here rather
+            // than assumed at message_stop, which called every reply that
+            // wasn't a tool call a finished one — including a reply cut off
+            // at the token ceiling.
+            if let reason = decode(resp.delta?.stop_reason) {
+                message.finishReason = reason
+            }
         case .message_start:
             if let message_resp = resp.message {
                 message.id = (message_resp.id != nil) ? message_resp.id! : message.id
                 message.finishReason = decode(message_resp.stop_reason)
             }
         case .message_stop:
-            message.finishReason = (message.toolCalls != nil) ? .toolCalls : .stop
+            // Only where the event above didn't say — it always does, but a
+            // reply with no stop reason at all shouldn't read as unfinished.
+            if message.finishReason == nil {
+                message.finishReason = (message.toolCalls != nil) ? .toolCalls : .stop
+            }
         case .content_block_start:
             if let contentBlock = resp.content_block {
                 switch contentBlock.type {
