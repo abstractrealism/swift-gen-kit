@@ -78,7 +78,7 @@ extension OpenAIService: ChatService {
 
 extension OpenAIService {
 
-    private func makeRequest(_ request: ChatServiceRequest, streaming: Bool) -> OpenAI.ChatRequest {
+    func makeRequest(_ request: ChatServiceRequest, streaming: Bool) -> OpenAI.ChatRequest {
         var req = OpenAI.ChatRequest(
             messages: encode(messages: request.messages),
             model: request.model.id,
@@ -88,6 +88,12 @@ extension OpenAIService {
             tool_choice: encode(request.toolChoice),
             verbosity: request.options["verbosity"]?.stringValue.flatMap(OpenAI.ChatRequest.Verbosity.init)
         )
+        // A stream reports what it cost only if asked. Groq sends usage
+        // regardless, OpenAI and DeepSeek send none without this, and every
+        // dialect here documents the option.
+        if streaming {
+            req.stream_options = .init(include_usage: true)
+        }
         switch reasoning(from: request.options, model: request.model) {
         case .nothing:
             break
@@ -686,12 +692,52 @@ extension OpenAIService {
         let text = reasoning.isEmpty
             ? choice.message.content
             : compose(thinking: reasoning, answer: choice.message.content ?? "")
-        return Message(
+        var message = Message(
             role: decode(choice.message.role),
             contents: [decode(text)].compactMap { $0 },
             toolCalls: choice.message.tool_calls?.map { decode($0) },
             finishReason: decode(choice.finish_reason)
         )
+        record(usage: resp.usage, model: resp.model, into: &message)
+        return message
+    }
+
+    /// What the reply cost, carried on the message under the same
+    /// provider-neutral names the Ollama provider uses, so a caller can show
+    /// it without knowing which service answered.
+    ///
+    /// Nothing recorded this before, so every hosted service's reply arrived
+    /// with no counts at all — and an app showing them showed nothing, on
+    /// every provider but Ollama.
+    ///
+    /// Each field is written only when it arrives. A stream reports usage on
+    /// one chunk out of thousands, and this runs on all of them.
+    nonisolated private func record(usage: OpenAI.Usage?, model: String?, into message: inout Message) {
+        // Which model actually answered. Reported on every chunk, and worth
+        // keeping per message: a conversation can change model between
+        // messages, so tokens and a rate mean nothing without it.
+        if let model, !model.isEmpty {
+            message.metadata["model"] = .string(model)
+        }
+        guard let usage else { return }
+
+        if let input = usage.prompt_tokens {
+            message.metadata["inputTokens"] = .int(input)
+        }
+        if let output = usage.completion_tokens {
+            message.metadata["outputTokens"] = .int(output)
+        }
+        // Generation alone, where timing the request from outside would also
+        // count the wait in the queue. Groq reports it; nothing else does, so
+        // a rate is shown where it can be worked out and left off elsewhere.
+        if let seconds = usage.completion_time, seconds > 0 {
+            message.metadata["outputSeconds"] = .double(seconds)
+        }
+        // Reasoning is part of what was generated and is counted in the
+        // output, so it's kept as a share of it rather than added on.
+        if let reasoning = usage.completion_tokens_details?.reasoning_tokens, reasoning > 0 {
+            message.metadata["thinkingTokens"] = .int(reasoning)
+        }
     }
     
     private func decode(_ role: String) -> Message.Role {
@@ -766,6 +812,11 @@ extension OpenAIService {
     }
 
     nonisolated func patchMessage(_ message: inout Message, with resp: OpenAI.ChatStreamResponse) {
+        // Before the guard below, because the chunk carrying usage may carry
+        // nothing else: OpenAI sends it as a final chunk with `choices` empty,
+        // so reading it after that guard read it never.
+        record(usage: resp.usage, model: resp.model, into: &message)
+
         guard let choice = resp.choices.first else { return }
 
         // Where the endpoint returns reasoning in the open, it and the answer
