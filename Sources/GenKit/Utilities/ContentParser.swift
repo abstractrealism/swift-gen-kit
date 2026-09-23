@@ -130,3 +130,23 @@ public final class ContentParser {
         return out
     }
 }
+
+/// A reply's answer as it should be read, given the reasoning is being
+/// wrapped separately.
+///
+/// Where a service parses `<think>…</think>` out of a model's raw output
+/// into a field of its own, the closing tag can be left behind at the front
+/// of the content. Groq's Qwen does this: the reasoning arrives whole in
+/// `reasoning`, and the content it hands back begins `</think>`. Wrapped in
+/// a block of our own making, that tag became the first thing on screen
+/// after the reasoning — a stray `</think>` above the answer, which reads as
+/// the app having mangled something.
+///
+/// Only ever a tag with nothing before it but space, and only where
+/// reasoning is being folded anyway. An answer that genuinely opens with a
+/// closing tag it never opened isn't a thing a model writes.
+func strippingLeadingCloseTag(_ answer: String) -> String {
+    let trimmed = answer.drop { $0.isWhitespace }
+    guard trimmed.hasPrefix("</think>") else { return answer }
+    return String(trimmed.dropFirst("</think>".count).drop { $0.isWhitespace })
+}

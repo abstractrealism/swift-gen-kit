@@ -438,6 +438,7 @@ extension OllamaService {
     /// as it arrives.
     private func compose(thinking: String, answer: String) -> String {
         guard !thinking.isEmpty else { return answer }
+        let answer = strippingLeadingCloseTag(answer)
         let closing = answer.isEmpty ? "" : "\n</think>\n"
         return "<think>\n" + thinking + closing + answer
     }
