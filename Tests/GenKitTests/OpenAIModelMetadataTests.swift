@@ -153,3 +153,109 @@ final class OpenAICapabilityAwareRequestTests: XCTestCase {
         XCTAssertEqual(sent.reasoning_effort?.rawValue, "high")
     }
 }
+
+/// DeepSeek reports its reasoning levels and its reply ceiling under its own
+/// names. Entry verbatim from `GET /v1/models`, 23 Sept 2026.
+final class DeepSeekModelMetadataTests: XCTestCase {
+
+    private static let flash = #"""
+    {"id":"deepseek-flash","object":"model","owned_by":"deepseek","name":"DeepSeek-V4.1-Flash","context_window":1048576,"max_output_tokens":393216,"input_modalities":["text","image"],"output_modalities":["text"],"effort":{"supported_levels":["low","high","max"],"default_level":"high"}}
+    """#
+
+    private func model(_ json: String) throws -> OpenAI.Model {
+        try JSONDecoder().decode(OpenAI.Model.self, from: Data(json.utf8))
+    }
+
+    func testTheLevelsAndTheCeilingAreCarriedOnto() async throws {
+        let service = OpenAIService(apiKey: "test", dialect: .deepSeek)
+        let decoded = await service.decodeForTesting(try model(Self.flash))
+
+        XCTAssertEqual(decoded.name, "DeepSeek-V4.1-Flash")
+        XCTAssertEqual(decoded.contextWindow, 1_048_576)
+        XCTAssertEqual(decoded.maxOutput, 393_216, "reported as max_output_tokens, not max_completion_tokens")
+        XCTAssertEqual(decoded.reasoning?.levels, ["low", "high", "max"])
+        XCTAssertEqual(decoded.reasoning?.defaultLevel, "high")
+        XCTAssertEqual(decoded.capabilities?.contains(.vision), true)
+        // Named by the presence of the levels and nowhere else. Missing it
+        // stripped the setting from the request, and a reasoning model then
+        // didn't reason.
+        XCTAssertEqual(decoded.capabilities?.contains(.thinking), true)
+    }
+
+    /// The table recorded low/high/max from DeepSeek's Thinking Mode guide.
+    /// The service now says so itself, and what it says wins.
+    func testWhatIsReportedBeatsWhatIsRemembered() async throws {
+        let service = OpenAIService(apiKey: "test", dialect: .deepSeek)
+        let decoded = await service.decodeForTesting(try model(Self.flash))
+
+        let supported = OpenAIService.Reasoning.supported(by: decoded, dialect: .deepSeek)
+        XCTAssertEqual(supported.levels, ["low", "high", "max"])
+        // The parts the list doesn't report stay with the table: that medium
+        // is another word for high, and that thinking is switched off with a
+        // parameter of its own rather than a level.
+        XCTAssertEqual(supported.aliases["medium"], "high")
+        XCTAssertTrue(supported.offSwitch)
+    }
+
+    func testAModelThatReportsNoLevelsStillUsesTheTable() {
+        let model = GenKit.Model(id: "deepseek-flash", owner: "deepseek")
+        let supported = OpenAIService.Reasoning.supported(by: model, dialect: .deepSeek)
+        XCTAssertEqual(supported.levels, ["low", "high", "max"])
+    }
+
+    func testAReportedLevelIsWhatGetsSent() async throws {
+        let service = OpenAIService(apiKey: "test", dialect: .deepSeek)
+        let decoded = await service.decodeForTesting(try model(Self.flash))
+
+        var request = ChatServiceRequest(model: decoded, messages: [Message(role: .user, content: "hi")])
+        request.options["effort"] = .string("medium")
+
+        // Aliased to high by the table, and high is a level it reports.
+        let sent = await service.makeRequest(request, streaming: true)
+        XCTAssertEqual(sent.reasoning_effort?.rawValue, "high")
+        XCTAssertEqual(sent.max_tokens, nil, "no ceiling was asked for")
+    }
+}
+
+/// The day a service stops serving a model, where it publishes one.
+final class RetirementDateTests: XCTestCase {
+
+    private func model(_ json: String) throws -> OpenAI.Model {
+        try JSONDecoder().decode(OpenAI.Model.self, from: Data(json.utf8))
+    }
+
+    func testADateIsRead() throws {
+        let json = #"{"id":"gpt-5-codex","object":"model","created":1,"owned_by":"system","shutdown_date":"2026-07-23"}"#
+        let date = try XCTUnwrap(OpenAIService.retirement(of: model(json)))
+
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(identifier: "UTC")!
+        XCTAssertEqual(calendar.dateComponents([.year, .month, .day], from: date).year, 2026)
+        XCTAssertEqual(calendar.dateComponents([.year, .month, .day], from: date).month, 7)
+        XCTAssertEqual(calendar.dateComponents([.year, .month, .day], from: date).day, 23)
+    }
+
+    func testNoDateIsNoClaim() throws {
+        let explicit = #"{"id":"m","object":"model","created":1,"owned_by":"o","shutdown_date":null}"#
+        XCTAssertNil(OpenAIService.retirement(of: try model(explicit)))
+
+        let absent = #"{"id":"m","object":"model","created":1,"owned_by":"o"}"#
+        XCTAssertNil(OpenAIService.retirement(of: try model(absent)))
+    }
+
+    func testAPastDateHasRetiredAndAFutureOneHasNot() {
+        let past = GenKit.Model(id: "a", owner: "o", retiresOn: .now.addingTimeInterval(-86_400 * 2))
+        let future = GenKit.Model(id: "b", owner: "o", retiresOn: .now.addingTimeInterval(86_400 * 2))
+        let undated = GenKit.Model(id: "c", owner: "o")
+
+        XCTAssertTrue(past.hasRetired)
+        XCTAssertFalse(future.hasRetired)
+        XCTAssertFalse(undated.hasRetired, "no announced end is not an end")
+    }
+
+    /// The day it stops, not the instant — so the day itself is not yet past.
+    func testTheDayItselfIsNotPast() {
+        let today = GenKit.Model(id: "a", owner: "o", retiresOn: .now)
+        XCTAssertFalse(today.hasRetired)
+    }
+}
