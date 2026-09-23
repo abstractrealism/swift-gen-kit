@@ -148,6 +148,13 @@ extension Service {
     /// Services that list only what's installed, or only a dozen models,
     /// don't have this problem and everything they offer counts.
     public func isLikelyChatModel(modelID: String) -> Bool {
+        // A guess only where there's nothing better. Where the service said
+        // what a model is for, that settles it — a transcription model is
+        // not a chat model whose name happens to look wrong, and a chat
+        // model with an odd name is still a chat model.
+        if let capabilities = models.first(where: { $0.id == modelID })?.capabilities {
+            return capabilities.contains(.completion)
+        }
         switch kind {
         case .openAI:
             let notChat: Set<String> = [
