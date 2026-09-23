@@ -127,7 +127,19 @@ extension OpenAIService {
         // The ceiling goes by two names. OpenAI deprecated `max_tokens` for
         // `max_completion_tokens` and its reasoning models reject the old one;
         // DeepSeek documents `max_tokens` and nothing else.
-        if let ceiling = request.options["max_tokens"]?.intValue {
+        if var ceiling = request.options["max_tokens"]?.intValue {
+            // Not above what the model allows. The setting is one figure for
+            // a whole service, and a service's models don't agree on what
+            // they'll write — Groq allows gpt-oss-120b 65,536 tokens and
+            // qwen3.8-27b 16,384 — so a figure chosen with one in mind is a
+            // refused request on the other. Asking for less than was set is
+            // the lesser wrong: the alternative is no answer at all.
+            if let allowed = request.model.maxOutput, ceiling > allowed {
+                logger.info(
+                    "\(request.model.id, privacy: .public) allows \(allowed, privacy: .public) tokens a reply; asking for that rather than \(ceiling, privacy: .public)"
+                )
+                ceiling = allowed
+            }
             switch dialect {
             case .deepSeek:
                 req.max_tokens = ceiling
