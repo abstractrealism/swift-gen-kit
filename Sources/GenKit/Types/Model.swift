@@ -70,9 +70,31 @@ public struct Model: Identifiable, Codable, Hashable, Sendable {
 
     public var reasoning: Reasoning?
 
+    /// The day the service stops serving this model, where it publishes one.
+    ///
+    /// A date already past is the useful case, and not a hypothetical:
+    /// OpenAI lists 136 models, dates 58 of them, and 17 of those dates had
+    /// gone by while the models were still being offered. A date still to
+    /// come is worth showing rather than acting on.
+    ///
+    /// Nil means no *announced* end, which is not the same as no end — a
+    /// model can start refusing requests with nothing published against it,
+    /// and `gpt-4o-search-preview` did.
+    public var retiresOn: Date?
+
+    /// Whether the day it stops being served has passed.
+    ///
+    /// Compared as a day rather than an instant: the date carries no time,
+    /// and a service in another timezone would otherwise be right or wrong
+    /// by one depending on where the reader is standing.
+    public var hasRetired: Bool {
+        guard let retiresOn else { return false }
+        return Calendar.current.startOfDay(for: retiresOn) < Calendar.current.startOfDay(for: .now)
+    }
+
     public init(id: String, family: String? = nil, name: String? = nil, owner: String, contextWindow: Int? = nil,
                 maxOutput: Int? = nil, trainingCutoff: Date? = nil, capabilities: Set<Capability>? = nil,
-                loadedContextWindow: Int? = nil, reasoning: Reasoning? = nil) {
+                loadedContextWindow: Int? = nil, reasoning: Reasoning? = nil, retiresOn: Date? = nil) {
         self.id = id
         self.family = family
         self.name = name
@@ -83,6 +105,7 @@ public struct Model: Identifiable, Codable, Hashable, Sendable {
         self.capabilities = capabilities
         self.loadedContextWindow = loadedContextWindow
         self.reasoning = reasoning
+        self.retiresOn = retiresOn
     }
 
     /// Whether this model supports something, when nothing is known counting

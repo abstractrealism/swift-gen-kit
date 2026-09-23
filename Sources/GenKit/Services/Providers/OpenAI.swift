@@ -172,7 +172,7 @@ extension OpenAIService {
         }
         guard let raw = options["effort"]?.stringValue else { return .nothing }
 
-        let supported = Reasoning.supported(byModel: model.id, dialect: dialect)
+        let supported = Reasoning.supported(by: model, dialect: dialect)
         guard let levels = supported.levels else {
             // Either the model takes no such setting — in which case Off is
             // already true of it — or nothing is known, and a guess here is a
@@ -301,6 +301,31 @@ extension OpenAIService {
 
         /// Every level any endpoint has named, least to most.
         static let order = ["none", "minimal", "low", "medium", "high", "xhigh", "max"]
+
+        /// What this model takes, preferring what the service said over what
+        /// this file remembers.
+        ///
+        /// DeepSeek reports its levels on every model — low, high and max,
+        /// with high by default — which is what the row below records after
+        /// a reading of its Thinking Mode guide. A reported answer doesn't
+        /// go stale, so it wins; the table answers for the endpoints that
+        /// report nothing, and for models stored before this was read.
+        ///
+        /// The aliases and the off switch stay with the table either way:
+        /// the list says which levels a model takes, not that `medium` is
+        /// another word for `high`, nor that thinking is turned off with a
+        /// parameter of its own rather than a level.
+        static func supported(by model: Model, dialect: Dialect) -> Reasoning {
+            let remembered = supported(byModel: model.id, dialect: dialect)
+            guard let reported = model.reasoning?.levels, !reported.isEmpty else {
+                return remembered
+            }
+            return Reasoning(
+                levels: reported,
+                aliases: remembered.aliases,
+                offSwitch: remembered.offSwitch
+            )
+        }
 
         static func supported(byModel id: String, dialect: Dialect) -> Reasoning {
             switch dialect {
@@ -839,9 +864,36 @@ extension OpenAIService {
             name: model.name ?? model.id,
             owner: model.owned_by ?? "openai",
             contextWindow: model.context_window,
-            maxOutput: model.max_completion_tokens,
-            capabilities: Self.capabilities(of: model)
+            maxOutput: model.maxOutput,
+            capabilities: Self.capabilities(of: model),
+            reasoning: Self.reasoning(of: model),
+            retiresOn: Self.retirement(of: model)
         )
+    }
+
+    /// How a listed model wants to be asked to reason, where it says.
+    ///
+    /// DeepSeek reports the levels outright, which is what this provider
+    /// had hardcoded from its Thinking Mode guide. Groq reports only that a
+    /// model reasons, so its levels stay in the table.
+    nonisolated static func reasoning(of model: OpenAI.Model) -> Model.Reasoning? {
+        guard let effort = model.effort,
+              effort.supported_levels?.isEmpty == false || effort.default_level != nil
+        else {
+            return nil
+        }
+        return .init(levels: effort.supported_levels, defaultLevel: effort.default_level)
+    }
+
+    /// The day the service stops serving it. A day, with no time and no
+    /// zone, so it's read as one.
+    nonisolated static func retirement(of model: OpenAI.Model) -> Date? {
+        guard let raw = model.shutdown_date, !raw.isEmpty else { return nil }
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(identifier: "UTC") ?? .gmt
+        let parts = raw.split(separator: "-").compactMap { Int($0) }
+        guard parts.count == 3 else { return nil }
+        return calendar.date(from: DateComponents(year: parts[0], month: parts[1], day: parts[2]))
     }
 
     /// What a listed model can do, where the list says.
@@ -859,6 +911,7 @@ extension OpenAIService {
         guard model.input_modalities != nil
             || model.output_modalities != nil
             || model.supported_features != nil
+            || model.effort != nil
         else {
             return nil
         }
@@ -876,7 +929,11 @@ extension OpenAIService {
         if features.contains("tools") {
             capabilities.insert(.tools)
         }
-        if features.contains("reasoning") {
+        // Named in one place or the other: Groq puts it among the features,
+        // DeepSeek reports the levels instead and mentions it nowhere else.
+        // Missing it means the request is stripped of a setting the model
+        // does take, which is how a reasoning model ends up not reasoning.
+        if features.contains("reasoning") || model.effort != nil {
             capabilities.insert(.thinking)
         }
         return capabilities
