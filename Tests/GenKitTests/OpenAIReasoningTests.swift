@@ -217,6 +217,33 @@ final class OpenAIReasoningFoldTests: XCTestCase {
         XCTAssertEqual(message.metadata["answer"]?.stringValue, "391")
     }
 
+    /// Groq's Qwen parses `<think>…</think>` out of the model's raw output
+    /// into `reasoning` and leaves the closing tag at the front of the
+    /// content. Wrapped in a block of our own, it appeared on screen as a
+    /// stray `</think>` above the answer.
+    func testAClosingTagLeftAtTheFrontOfTheAnswerIsDropped() throws {
+        let service = OpenAIService(apiKey: "test", dialect: .groq)
+        var message = Message(role: .assistant)
+
+        service.patchMessage(&message, with: try chunk(reasoning: "Let's search.", content: nil, field: "reasoning"))
+        service.patchMessage(&message, with: try chunk(reasoning: nil, content: "</think>"))
+        service.patchMessage(&message, with: try chunk(reasoning: nil, content: "\n\n<tool_call>"))
+
+        // The block closes once, where we close it, and what the model wrote
+        // after it is left exactly as written — a tool call it invented with
+        // no tools offered is the model's business, not ours to tidy away.
+        XCTAssertEqual(text(of: message), "<think>\nLet's search.\n</think>\n<tool_call>")
+    }
+
+    func testAnAnswerThatMerelyMentionsTheTagIsUntouched() throws {
+        let service = OpenAIService(apiKey: "test", dialect: .groq)
+        var message = Message(role: .assistant)
+
+        service.patchMessage(&message, with: try chunk(reasoning: "hm", content: nil, field: "reasoning"))
+        service.patchMessage(&message, with: try chunk(reasoning: nil, content: "Close it with </think> at the end."))
+        XCTAssertEqual(text(of: message), "<think>\nhm\n</think>\nClose it with </think> at the end.")
+    }
+
     func testReasoningIsHandedBackToDeepSeekApart() throws {
         let service = OpenAIService(apiKey: "test", dialect: .deepSeek)
         var message = Message(role: .assistant)
