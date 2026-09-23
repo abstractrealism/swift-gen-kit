@@ -79,13 +79,30 @@ extension OpenAIService: ChatService {
 extension OpenAIService {
 
     func makeRequest(_ request: ChatServiceRequest, streaming: Bool) -> OpenAI.ChatRequest {
+        // Where the service listed what the model can do, send only that.
+        // Unknown is not incapable: a model that reported nothing gets the
+        // request exactly as asked for, since every endpoint but Groq reports
+        // nothing and narrowing on a silence would strip tools from models
+        // that handle them perfectly well. Same rule as the Ollama provider.
+        func supports(_ capability: Model.Capability) -> Bool {
+            request.model.capabilities?.contains(capability) ?? true
+        }
+
+        var tools = encode(request.tools)
+        if let offered = tools, !offered.isEmpty, !supports(.tools) {
+            logger.warning(
+                "\(request.model.id, privacy: .public) does not support tools; sending the request without \(offered.count, privacy: .public) of them"
+            )
+            tools = nil
+        }
+
         var req = OpenAI.ChatRequest(
             messages: encode(messages: request.messages),
             model: request.model.id,
             stream: streaming ? true : nil,
             temperature: request.options["temperature"]?.doubleValue,
-            tools: encode(request.tools),
-            tool_choice: encode(request.toolChoice),
+            tools: tools,
+            tool_choice: tools == nil ? nil : encode(request.toolChoice),
             verbosity: request.options["verbosity"]?.stringValue.flatMap(OpenAI.ChatRequest.Verbosity.init)
         )
         // A stream reports what it cost only if asked. Groq sends usage
@@ -94,13 +111,17 @@ extension OpenAIService {
         if streaming {
             req.stream_options = .init(include_usage: true)
         }
-        switch reasoning(from: request.options, model: request.model) {
-        case .nothing:
-            break
-        case .effort(let level):
-            req.reasoning_effort = level
-        case .thinkingOff:
-            req.thinking = .disabled
+        // A model the service says doesn't reason has nothing to grade, and
+        // the endpoint refuses the parameter rather than ignoring it.
+        if supports(.thinking) {
+            switch reasoning(from: request.options, model: request.model) {
+            case .nothing:
+                break
+            case .effort(let level):
+                req.reasoning_effort = level
+            case .thinkingOff:
+                req.thinking = .disabled
+            }
         }
 
         // The ceiling goes by two names. OpenAI deprecated `max_tokens` for
@@ -796,12 +817,57 @@ extension OpenAIService {
         )
     }
     
+    func decodeForTesting(_ model: OpenAI.Model) -> Model { decode(model) }
+
     private func decode(_ model: OpenAI.Model) -> Model {
         Model(
             id: .init(model.id),
-            name: model.id,
-            owner: model.owned_by ?? "openai"
+            // The id where there's no name, since something has to be shown
+            // and the id is what every caller showed before names existed.
+            name: model.name ?? model.id,
+            owner: model.owned_by ?? "openai",
+            contextWindow: model.context_window,
+            maxOutput: model.max_completion_tokens,
+            capabilities: Self.capabilities(of: model)
         )
+    }
+
+    /// What a listed model can do, where the list says.
+    ///
+    /// Nil where it doesn't, which is every endpoint but Groq — and nil
+    /// means unknown rather than incapable, so nothing narrows on a silence.
+    ///
+    /// The modality vocabulary is wider than text or not. Whisper reports
+    /// `["audio"]` in and `["transcription"]` out; a speech model text in
+    /// and `["audio"]` out; a vision model `["text", "image"]` in. Both ends
+    /// have to be text for a model to hold a conversation, and a model
+    /// failing that is not a lesser chat model but a model for another
+    /// endpoint entirely.
+    nonisolated static func capabilities(of model: OpenAI.Model) -> Set<Model.Capability>? {
+        guard model.input_modalities != nil
+            || model.output_modalities != nil
+            || model.supported_features != nil
+        else {
+            return nil
+        }
+        let inputs = Set(model.input_modalities ?? [])
+        let outputs = Set(model.output_modalities ?? [])
+        let features = Set(model.supported_features ?? [])
+
+        var capabilities: Set<Model.Capability> = []
+        if inputs.contains("text"), outputs.contains("text") {
+            capabilities.insert(.completion)
+        }
+        if inputs.contains("image") {
+            capabilities.insert(.vision)
+        }
+        if features.contains("tools") {
+            capabilities.insert(.tools)
+        }
+        if features.contains("reasoning") {
+            capabilities.insert(.thinking)
+        }
+        return capabilities
     }
     
     /// Folds reasoning into the content as a `<think>` block.
