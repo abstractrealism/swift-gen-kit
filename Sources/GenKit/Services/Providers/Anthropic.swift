@@ -35,13 +35,18 @@ public actor AnthropicService {
             tools: encode(tools)
         )
 
-        // Reasoning, and how much work to put in overall. Two settings rather
-        // than one: `thinking` decides whether the model reasons at all, and
-        // `effort` how deeply — including how deeply it reasons when it does.
-        //
-        // What each model accepts differs, and it refuses what it doesn't
-        // rather than ignoring it, so this asks first. See `Thinking`.
-        let supported = Thinking.supported(byModel: model.id)
+        applyReasoning(to: &req, options: options, model: model)
+        return req
+    }
+
+    /// Reasoning, and how much work to put in overall. Two settings rather
+    /// than one: `thinking` decides whether the model reasons at all, and
+    /// `effort` how deeply — including how deeply it reasons when it does.
+    ///
+    /// What each model accepts differs, and it refuses what it doesn't rather
+    /// than ignoring it, so this asks first. See `Thinking`.
+    private func applyReasoning(to req: inout Anthropic.ChatRequest, options: [String: Value], model: Model) {
+        let supported = Thinking.supported(by: model)
 
         switch effort(from: options) {
         case .none:
@@ -63,8 +68,6 @@ public actor AnthropicService {
         case .level(let level):
             apply(effort: level, to: &req, supported: supported, model: model)
         }
-
-        return req
     }
 
     /// Asks for reasoning at a level, in whichever of the two shapes this
@@ -75,6 +78,7 @@ public actor AnthropicService {
         supported: Thinking,
         model: Model
     ) {
+        let level = nearestLevel(to: level, of: model)
         if supported.adaptive {
             // `summarized` because the default is `omitted`, under which the
             // blocks still arrive carrying a signature and no text. A caller
@@ -117,12 +121,51 @@ public actor AnthropicService {
         return nil
     }
 
+    func makeRequestForTesting(model: Model, options: [String: Value]) -> Anthropic.ChatRequest {
+        var req = Anthropic.ChatRequest(model: model.id, messages: [], max_tokens: 16384)
+        applyReasoning(to: &req, options: options, model: model)
+        return req
+    }
+
+    /// The level to ask for, given what this model says it takes.
+    ///
+    /// Only where it says. Models differ by more than which mode they
+    /// take — Sonnet 4.6 takes low, medium, high and max but not xhigh,
+    /// while Opus 5.5 takes all five — and a level a model doesn't have is
+    /// refused rather than rounded, so asking for the nearest it does have
+    /// is the difference between a slightly shallower answer and none.
+    ///
+    /// Ties go to the lower level, the levels being in ascending order.
+    private func nearestLevel(to level: String, of model: Model) -> String {
+        guard let levels = model.reasoning?.levels, !levels.isEmpty, !levels.contains(level) else {
+            return level
+        }
+        let order = ["low", "medium", "high", "xhigh", "max"]
+        guard let target = order.firstIndex(of: level) else { return level }
+
+        let nearest = levels
+            .compactMap { candidate in order.firstIndex(of: candidate).map { (candidate, abs($0 - target)) } }
+            .min { $0.1 < $1.1 }?.0
+        guard let nearest else { return level }
+
+        logger.info(
+            "\(model.id, privacy: .public) doesn't take \(level, privacy: .public); asking for \(nearest, privacy: .public)"
+        )
+        return nearest
+    }
+
     /// What a model will accept in the way of reasoning.
     ///
-    /// There is no endpoint that says, and the API rejects what a model
-    /// doesn't take rather than ignoring it — `adaptive` to an
-    /// extended-thinking model is a 400, and so is `enabled` to an adaptive
-    /// one. So it's a table, and it will need adding to as models arrive.
+    /// The API rejects what a model doesn't take rather than ignoring it —
+    /// `adaptive` to an extended-thinking model is a 400, and so is `enabled`
+    /// to an adaptive one — so this has to be right per model.
+    ///
+    /// The model list answers it, which was not known when the table below
+    /// was written: every entry reports its thinking types and effort levels.
+    /// So the order is reported, then remembered, then assumed. The table is
+    /// what answers for a service that reported nothing — a model loaded
+    /// before any of this existed, say — and it no longer needs adding to as
+    /// models arrive, since a listed model describes itself.
     ///
     /// Matched on the id containing a pattern, since ids carry a date
     /// (`claude-haiku-4-5-20251001`), and in order, because the more specific
@@ -150,8 +193,36 @@ public actor AnthropicService {
         /// the request comes back refused.
         static let assumed = Thinking(adaptive: true)
 
-        static func supported(byModel id: String) -> Thinking {
-            known(byModel: id) ?? .assumed
+        static func supported(by model: Model) -> Thinking {
+            reported(by: model) ?? known(byModel: model.id) ?? .assumed
+        }
+
+        /// What the service itself said about this model, where it said
+        /// anything.
+        ///
+        /// The list reports, per model, which `thinking.type` values it takes
+        /// and which effort levels — the two things the table below exists to
+        /// remember, and the two that change with every model that ships. A
+        /// reported answer is always better than a remembered one, so it
+        /// wins; the table stays for services and accounts that report
+        /// nothing, and for the one thing the list doesn't say.
+        ///
+        /// `canDisable` is that thing. Nothing in the response distinguishes
+        /// a model that refuses `thinking: {type: "disabled"}` from one that
+        /// accepts it, so it comes from the table where the table knows and
+        /// is assumed true otherwise — the same assumption as before, and
+        /// wrong the same way, which is caught by the refusal.
+        static func reported(by model: Model) -> Thinking? {
+            guard let reasoning = model.reasoning else { return nil }
+            let modes = Set(reasoning.modes ?? [])
+            guard !modes.isEmpty || reasoning.levels != nil else { return nil }
+
+            return Thinking(
+                adaptive: modes.contains("adaptive"),
+                extended: modes.contains("enabled"),
+                canDisable: known(byModel: model.id)?.canDisable ?? true,
+                effort: !(reasoning.levels ?? []).isEmpty
+            )
         }
 
         /// What's actually recorded for a model, or nil where it isn't one
@@ -548,8 +619,55 @@ extension AnthropicService {
         Model(
             id: model.id,
             name: model.display_name,
-            owner: "anthropic"
+            owner: "anthropic",
+            contextWindow: model.max_input_tokens,
+            maxOutput: model.max_tokens,
+            capabilities: Self.capabilities(of: model),
+            reasoning: Self.reasoning(of: model)
         )
+    }
+
+    /// What a listed model can do. Nil where the list didn't say, which is
+    /// unknown rather than incapable.
+    nonisolated static func capabilities(of model: Anthropic.Model) -> Set<Model.Capability>? {
+        guard let reported = model.capabilities else { return nil }
+
+        // Every model here converses, and every one takes tools; neither is
+        // reported because neither has ever been in question.
+        var capabilities: Set<Model.Capability> = [.completion, .tools]
+        if reported.thinking?.supported == true {
+            capabilities.insert(.thinking)
+        }
+        if reported.image_input?.supported == true {
+            capabilities.insert(.vision)
+        }
+        return capabilities
+    }
+
+    /// How a listed model wants to be asked to reason.
+    ///
+    /// The levels are read one by one rather than from `effort.supported`,
+    /// because a model that takes none still reports the capability — with
+    /// nothing under it. So the levels present are the answer, and an empty
+    /// set means a model that reasons on a budget instead.
+    nonisolated static func reasoning(of model: Anthropic.Model) -> Model.Reasoning? {
+        guard let reported = model.capabilities else { return nil }
+
+        var levels: [String] = []
+        if let effort = reported.effort, effort.supported != false {
+            if effort.low?.supported == true { levels.append("low") }
+            if effort.medium?.supported == true { levels.append("medium") }
+            if effort.high?.supported == true { levels.append("high") }
+            if effort.xhigh?.supported == true { levels.append("xhigh") }
+            if effort.max?.supported == true { levels.append("max") }
+        }
+
+        var modes: [String] = []
+        if reported.thinking?.types?.adaptive?.supported == true { modes.append("adaptive") }
+        if reported.thinking?.types?.enabled?.supported == true { modes.append("enabled") }
+
+        guard !levels.isEmpty || !modes.isEmpty else { return nil }
+        return .init(levels: levels.isEmpty ? nil : levels, modes: modes.isEmpty ? nil : modes)
     }
 
     /// Closes an open `<think>` block, if the message is in one.
