@@ -120,6 +120,32 @@ final class OpenAICapabilityAwareRequestTests: XCTestCase {
         XCTAssertEqual(sent.reasoning_effort?.rawValue, "high")
     }
 
+    func testTheReplyCeilingIsCappedAtWhatTheModelAllows() async {
+        var request = request([.completion])
+        request.model = GenKit.Model(id: "qwen/qwen3.8-27b", owner: "groq", maxOutput: 16384)
+        request.options["max_tokens"] = .int(65536)
+
+        let sent = await service.makeRequest(request, streaming: true)
+        XCTAssertEqual(sent.max_completion_tokens, 16384, "one service-wide figure, models that don't agree")
+    }
+
+    func testAFigureWithinTheModelsLimitIsSentAsChosen() async {
+        var request = request([.completion])
+        request.model = GenKit.Model(id: "qwen/qwen3.8-27b", owner: "groq", maxOutput: 16384)
+        request.options["max_tokens"] = .int(8192)
+
+        let sent = await service.makeRequest(request, streaming: true)
+        XCTAssertEqual(sent.max_completion_tokens, 8192)
+    }
+
+    func testAModelThatReportsNoLimitIsSentTheFigureAsChosen() async {
+        var request = request([.completion])
+        request.options["max_tokens"] = .int(65536)
+
+        let sent = await service.makeRequest(request, streaming: true)
+        XCTAssertEqual(sent.max_completion_tokens, 65536)
+    }
+
     /// The services that report nothing, which is all of them but Groq.
     func testAModelReportingNothingIsSentEverythingAsked() async {
         let sent = await service.makeRequest(request(nil), streaming: true)
