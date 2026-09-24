@@ -385,6 +385,29 @@ extension AnthropicService: ChatService {
             """)
     }
 
+    /// What a message is, in blocks.
+    ///
+    /// Text *and* tool calls, where there are both. They used to be one or
+    /// the other — `contents ?? toolCalls` — and a turn that reasons before
+    /// calling a tool has contents, so the `tool_use` block was dropped from
+    /// every such turn. Then the reasoning was stripped out of the history by
+    /// the caller, leaving an empty text block, leaving nothing, leaving the
+    /// message out altogether: the model was never shown that it had called
+    /// anything, only results arriving as though somebody had typed them.
+    ///
+    /// It worked, after a fashion, because the other half was wrong to
+    /// match — a result went back as text rather than as a `tool_result`, so
+    /// there was no pairing for Anthropic to find fault with. Both halves
+    /// are right now, and they have to change together: a `tool_use` with no
+    /// `tool_result` after it is a 400.
+    private func blocks(of message: Message) -> [Anthropic.ChatRequest.Message.Content] {
+        var blocks = message.contents?.compactMap { encode($0) } ?? []
+        if message.role == .assistant {
+            blocks += message.toolCalls?.compactMap { encode($0) } ?? []
+        }
+        return blocks
+    }
+
     /// How many blocks were marked for caching. Two is the intended number —
     /// the system prompt and the end of the conversation — and zero means
     /// nothing was asked to be cached, which is worth being able to tell
@@ -452,10 +475,33 @@ extension AnthropicService {
 
     private func encode(messages: [Message]) -> [Anthropic.ChatRequest.Message] {
         var encoded: [Anthropic.ChatRequest.Message] = []
-        for message in messages where message.role != .system {
-            let content = (message.contents?.compactMap { encode($0) } ??
-                           message.toolCalls?.compactMap { encode($0) } ??
-                           [encode(message)].compactMap { $0 })
+        var pending = messages.filter { $0.role != .system }[...]
+
+        while let message = pending.first {
+            pending = pending.dropFirst()
+
+            // Every result for one round of calls in a single message.
+            //
+            // Anthropic pairs a `tool_result` with the `tool_use` that asked
+            // for it, and wants the results for a round together, immediately
+            // after the message that made the calls. A model that calls two
+            // tools at once — which this one does, most rounds — produces two
+            // tool messages here, and sent as two messages they would be two
+            // user turns, the first of them answering only half of what was
+            // asked.
+            if message.role == .tool {
+                var results = [message]
+                while let next = pending.first, next.role == .tool {
+                    results.append(next)
+                    pending = pending.dropFirst()
+                }
+                let blocks = results.compactMap { encode($0) }
+                guard !blocks.isEmpty else { continue }
+                encoded.append(.init(role: .user, content: blocks))
+                continue
+            }
+
+            let content = (blocks(of: message))
                 // Anthropic refuses an empty text block outright — "text
                 // content blocks must be non-empty" — and refuses a message
                 // with no blocks at all, so neither is sent.
