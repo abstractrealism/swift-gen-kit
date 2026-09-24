@@ -462,6 +462,9 @@ extension OpenAIService {
             if let reasoning = usage.completion_tokens_details?.reasoning_tokens {
                 parts.append("reasoning: \(reasoning)")
             }
+            if let cached = usage.prompt_cache_hit_tokens ?? usage.prompt_tokens_details?.cached_tokens, cached > 0 {
+                parts.append("cached: \(cached)")
+            }
         }
         return parts.joined(separator: " ")
     }
@@ -800,6 +803,14 @@ extension OpenAIService {
         // guess shouldn't share a key, or whichever is written second wins.
         if let reasoning = usage.completion_tokens_details?.reasoning_tokens, reasoning > 0 {
             message.metadata["reasoningTokens"] = .int(reasoning)
+        }
+        // How much of the prompt was already cached. DeepSeek caches without
+        // being asked and reports it under a name of its own; OpenAI reports
+        // the same figure in the details. Nothing here asks for caching —
+        // there is nothing to ask — so this is purely what happened.
+        let cached = usage.prompt_cache_hit_tokens ?? usage.prompt_tokens_details?.cached_tokens
+        if let cached, cached > 0 {
+            message.metadata["cachedTokens"] = .int(cached)
         }
     }
     
