@@ -275,3 +275,133 @@ final class AnthropicCacheLoggingTests: XCTestCase {
         )
     }
 }
+
+/// A tool exchange, as Anthropic needs to be told about it.
+///
+/// Confirmed broken against the live service before this: every tool round
+/// of a real conversation logged "leaving out an empty assistant message",
+/// once per round and accumulating, because the turn that made the calls
+/// was being dropped whole. The model answered anyway — results arrived as
+/// though somebody had typed them — which is why it went unnoticed, and
+/// which explains it re-running near-identical searches: it could not see
+/// what it had already asked.
+final class AnthropicToolBlockTests: XCTestCase {
+
+    private let service = AnthropicService(apiKey: "test")
+
+    private func request(_ messages: [Message]) async -> Anthropic.ChatRequest {
+        await service.makeRequestForTesting(
+            model: Model(id: "claude-sonnet-5", owner: "anthropic"),
+            messages: messages
+        )
+    }
+
+    private static func call(_ id: String, _ query: String) -> ToolCall {
+        ToolCall(
+            id: id,
+            type: "function",
+            function: .init(name: "web_search", arguments: #"{"query":"\#(query)"}"#),
+            custom: nil
+        )
+    }
+
+    /// The shape a real round produces: reasoning folded into text, then two
+    /// calls, then a result for each.
+    private static func round() -> [Message] {
+        var asking = Message(role: .assistant)
+        asking.contents = [.text("<think>\nLet me search.\n</think>\n")]
+        asking.toolCalls = [call("t1", "tofu Hudson"), call("t2", "tofu Beacon")]
+
+        return [
+            Message(role: .user, content: "Find me a Nashville tofu sandwich."),
+            asking,
+            Message(role: .tool, contents: [.text("ten results")], toolCallID: "t1", name: "web_search"),
+            Message(role: .tool, contents: [.text("nine results")], toolCallID: "t2", name: "web_search"),
+        ]
+    }
+
+    func testTheTurnThatMadeTheCallsSurvives() async {
+        let sent = await request(Self.round())
+        XCTAssertEqual(sent.messages.count, 3, "user, assistant, and one message of results")
+
+        let asking = sent.messages[1]
+        XCTAssertEqual(asking.role, .assistant)
+        // Text *and* tool calls, where before it was one or the other.
+        XCTAssertEqual(asking.content.filter { $0.type == .tool_use }.count, 2)
+        XCTAssertEqual(asking.content.compactMap { $0.id }.sorted(), ["t1", "t2"])
+    }
+
+    /// Both results in one message, immediately after the calls. Sent
+    /// separately they would be two user turns, the first answering half of
+    /// what was asked.
+    func testTheResultsForARoundArriveTogether() async {
+        let sent = await request(Self.round())
+        let results = sent.messages[2]
+
+        XCTAssertEqual(results.role, .user)
+        XCTAssertEqual(results.content.count, 2)
+        XCTAssertTrue(results.content.allSatisfy { $0.type == .tool_result })
+        XCTAssertEqual(results.content.compactMap { $0.tool_use_id }.sorted(), ["t1", "t2"])
+    }
+
+    /// Every `tool_use` has a `tool_result` after it, which is the rule a
+    /// mismatch is a 400 over.
+    func testEveryCallIsAnswered() async {
+        let sent = await request(Self.round())
+        let asked = Set(sent.messages.flatMap { $0.content.filter { $0.type == .tool_use }.compactMap(\.id) })
+        let answered = Set(sent.messages.flatMap { $0.content.compactMap(\.tool_use_id) })
+        XCTAssertEqual(asked, answered)
+        XCTAssertFalse(asked.isEmpty)
+    }
+
+    /// A result is a `tool_result`, not prose. It used to be prose, which is
+    /// what kept the dropped `tool_use` from ever being noticed.
+    func testAResultIsNotSentAsText() async {
+        let sent = await request(Self.round())
+        XCTAssertFalse(
+            sent.messages[2].content.contains { $0.type == .text },
+            "a result has a type of its own"
+        )
+    }
+
+    /// And the assistant turn is no longer emptied by stripping: the
+    /// reasoning goes, the calls stay.
+    func testStrippingTheReasoningLeavesTheCalls() async {
+        var asking = Message(role: .assistant)
+        asking.contents = [.text("")]
+        asking.toolCalls = [Self.call("t1", "tofu")]
+
+        let sent = await request([
+            Message(role: .user, content: "go"),
+            asking,
+            Message(role: .tool, contents: [.text("results")], toolCallID: "t1", name: "web_search"),
+        ])
+        XCTAssertEqual(sent.messages.count, 3)
+        XCTAssertEqual(sent.messages[1].content.count, 1)
+        XCTAssertEqual(sent.messages[1].content.first?.type, .tool_use)
+    }
+
+    /// Two rounds in one turn: each round's results stay with its own round
+    /// rather than being swept together.
+    func testTwoRoundsStayApart() async {
+        var first = Message(role: .assistant)
+        first.contents = [.text("")]
+        first.toolCalls = [Self.call("t1", "one")]
+
+        var second = Message(role: .assistant)
+        second.contents = [.text("")]
+        second.toolCalls = [Self.call("t2", "two")]
+
+        let sent = await request([
+            Message(role: .user, content: "go"),
+            first,
+            Message(role: .tool, contents: [.text("a")], toolCallID: "t1", name: "web_search"),
+            second,
+            Message(role: .tool, contents: [.text("b")], toolCallID: "t2", name: "web_search"),
+        ])
+
+        XCTAssertEqual(sent.messages.map(\.role), [.user, .assistant, .user, .assistant, .user])
+        XCTAssertEqual(sent.messages[2].content.compactMap(\.tool_use_id), ["t1"])
+        XCTAssertEqual(sent.messages[4].content.compactMap(\.tool_use_id), ["t2"])
+    }
+}
