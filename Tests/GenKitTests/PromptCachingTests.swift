@@ -226,3 +226,52 @@ final class AnthropicEmptyBlockTests: XCTestCase {
         XCTAssertEqual(sent.messages.first?.content.first?.text, "\n")
     }
 }
+
+/// The log lines that say whether any of the caching happened.
+final class AnthropicCacheLoggingTests: XCTestCase {
+
+    private let service = AnthropicService(apiKey: "test")
+
+    func testTheBreakpointsAreCounted() async {
+        let sent = await service.makeRequestForTesting(
+            model: Model(id: "claude-sonnet-5", owner: "anthropic"),
+            messages: [
+                Message(role: .system, content: "Be brief."),
+                Message(role: .user, content: "hi"),
+            ]
+        )
+        // The system prompt and the end of the conversation.
+        XCTAssertEqual(AnthropicService.breakpointsForTesting(in: sent), 2)
+    }
+
+    /// Nothing to mark in the history means one breakpoint, not none.
+    func testASystemPromptAloneIsOneBreakpoint() async {
+        let sent = await service.makeRequestForTesting(
+            model: Model(id: "claude-sonnet-5", owner: "anthropic"),
+            messages: [Message(role: .system, content: "Be brief.")]
+        )
+        XCTAssertEqual(AnthropicService.breakpointsForTesting(in: sent), 1)
+    }
+
+    func testAReadIsDistinguishedFromAWriteAndFromNeither() {
+        var read = Message(role: .assistant)
+        read.metadata["inputTokens"] = .int(22605)
+        read.metadata["outputTokens"] = .int(412)
+        read.metadata["cachedTokens"] = .int(21952)
+        XCTAssertTrue(AnthropicService.describeUsageForTesting(read).contains("cache read: 21952"))
+        XCTAssertFalse(AnthropicService.describeUsageForTesting(read).contains("untouched"))
+
+        var written = Message(role: .assistant)
+        written.metadata["inputTokens"] = .int(4108)
+        written.metadata["cacheWriteTokens"] = .int(4096)
+        XCTAssertTrue(AnthropicService.describeUsageForTesting(written).contains("cache write: 4096"))
+
+        var neither = Message(role: .assistant)
+        neither.metadata["inputTokens"] = .int(120)
+        neither.metadata["outputTokens"] = .int(30)
+        XCTAssertTrue(
+            AnthropicService.describeUsageForTesting(neither).contains("cache: untouched"),
+            "below the minimum cacheable length, and worth telling apart from a failure"
+        )
+    }
+}

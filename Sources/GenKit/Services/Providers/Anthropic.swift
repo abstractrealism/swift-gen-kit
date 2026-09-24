@@ -358,7 +358,9 @@ extension AnthropicService: ChatService {
             )
             throw error
         }
-        logger.info("← anthropic stream finished | \(self.describe(seen), privacy: .public)")
+        logger.info(
+            "← anthropic stream finished | \(self.describe(seen), privacy: .public) | \(Self.describe(usage: message), privacy: .public)"
+        )
     }
 
     /// What was asked for, in the terms the service was asked in.
@@ -378,8 +380,53 @@ extension AnthropicService: ChatService {
             | temperature: \(req.temperature.map { "\($0)" } ?? "unset", privacy: .public) \
             | tools: \(req.tools?.count ?? 0, privacy: .public) \
             | system: \(req.system?.count ?? 0, privacy: .public) \
-            | messages: \(req.messages.count, privacy: .public)
+            | messages: \(req.messages.count, privacy: .public) \
+            | cache breakpoints: \(Self.breakpoints(in: req), privacy: .public)
             """)
+    }
+
+    /// How many blocks were marked for caching. Two is the intended number —
+    /// the system prompt and the end of the conversation — and zero means
+    /// nothing was asked to be cached, which is worth being able to tell
+    /// apart from asking and being refused.
+    nonisolated static func breakpointsForTesting(in req: Anthropic.ChatRequest) -> Int { breakpoints(in: req) }
+
+    nonisolated static func describeUsageForTesting(_ message: Message) -> String { describe(usage: message) }
+
+    nonisolated private static func breakpoints(in req: Anthropic.ChatRequest) -> Int {
+        let system = req.system?.filter { $0.cache_control != nil }.count ?? 0
+        let messages = req.messages.reduce(0) { total, message in
+            total + message.content.filter { $0.cache_control != nil }.count
+        }
+        return system + messages
+    }
+
+    /// What the reply cost, once it has all arrived.
+    ///
+    /// Read off the message rather than accumulated here: the counts arrive
+    /// on two different events — the input on the first, the output on the
+    /// last — and `record(usage:)` has already folded both in.
+    ///
+    /// Cache reads and writes are named separately because they are priced
+    /// separately, a read being a tenth of an ordinary input token and a
+    /// write a quarter more. A round that reads is the caching working; a
+    /// round that only ever writes is paying for a cache nothing reads.
+    nonisolated private static func describe(usage message: Message) -> String {
+        let input = message.metadata["inputTokens"]?.intValue
+        let output = message.metadata["outputTokens"]?.intValue
+        guard input != nil || output != nil else { return "no usage reported" }
+
+        var parts = ["tokens: \(input ?? 0) in, \(output ?? 0) out"]
+        if let read = message.metadata["cachedTokens"]?.intValue, read > 0 {
+            parts.append("cache read: \(read)")
+        }
+        if let written = message.metadata["cacheWriteTokens"]?.intValue, written > 0 {
+            parts.append("cache write: \(written)")
+        }
+        if message.metadata["cachedTokens"] == nil, message.metadata["cacheWriteTokens"] == nil {
+            parts.append("cache: untouched")
+        }
+        return parts.joined(separator: " | ")
     }
 
     private func describe(_ events: [String: Int]) -> String {
