@@ -147,3 +147,82 @@ final class CacheReportingTests: XCTestCase {
         XCTAssertNil(message.metadata["cachedTokens"])
     }
 }
+
+/// Blocks Anthropic won't accept.
+///
+/// "messages: text content blocks must be non-empty" — a 400 on the whole
+/// request, which is how a second prompt to `claude-haiku-4-5` failed with
+/// three messages in the history and nothing obviously wrong with any of
+/// them.
+///
+/// Nothing the model produces is empty. These come from stripping: an
+/// assistant turn that reasoned and never reached an answer is a `<think>`
+/// block and nothing else, and a caller that takes reasoning out of the
+/// history before re-sending it — which Heat does by default, that reasoning
+/// being working rather than something the assistant said — is left holding
+/// an empty string.
+final class AnthropicEmptyBlockTests: XCTestCase {
+
+    private let service = AnthropicService(apiKey: "test")
+
+    private func request(_ messages: [Message]) async -> Anthropic.ChatRequest {
+        await service.makeRequestForTesting(
+            model: Model(id: "claude-haiku-4-5-20251001", owner: "anthropic"),
+            messages: messages
+        )
+    }
+
+    /// The failing shape, as the history arrives after stripping.
+    func testAnAssistantTurnStrippedToNothingIsLeftOut() async {
+        let sent = await request([
+            Message(role: .system, content: "Be brief."),
+            Message(role: .user, content: "What is 17 times 23?"),
+            Message(role: .assistant, content: ""),
+            Message(role: .user, content: "And 18 times 23?"),
+        ])
+
+        XCTAssertEqual(sent.messages.count, 2)
+        XCTAssertEqual(sent.messages.map(\.role), [.user, .user])
+        XCTAssertTrue(
+            sent.messages.allSatisfy { $0.content.allSatisfy { ($0.text ?? "x").isEmpty == false } },
+            "no empty text block reaches the request"
+        )
+    }
+
+    /// An empty block among good ones goes, and the message stays.
+    func testAnEmptyBlockBesideARealOneIsDropped() async {
+        var message = Message(role: .assistant)
+        message.contents = [.text(""), .text("391.")]
+
+        let sent = await request([message])
+        XCTAssertEqual(sent.messages.count, 1)
+        XCTAssertEqual(sent.messages.first?.content.count, 1)
+        XCTAssertEqual(sent.messages.first?.content.first?.text, "391.")
+    }
+
+    /// And the cache breakpoint lands on what's left, not on what went.
+    func testTheBreakpointFollowsTheBlocksThatRemain() async {
+        var stripped = Message(role: .assistant)
+        stripped.contents = [.text("")]
+
+        let sent = await request([
+            Message(role: .user, content: "hi"),
+            stripped,
+        ])
+        XCTAssertEqual(sent.messages.count, 1)
+        XCTAssertEqual(sent.messages.first?.content.last?.text, "hi")
+        XCTAssertEqual(sent.messages.first?.content.last?.cache_control?.type, .ephemeral)
+    }
+
+    /// Whitespace is content. Only an actually empty string is refused, and
+    /// guessing at which whitespace the model meant isn't this layer's
+    /// business.
+    func testWhitespaceIsLeftAlone() async {
+        var message = Message(role: .assistant)
+        message.contents = [.text("\n")]
+
+        let sent = await request([message])
+        XCTAssertEqual(sent.messages.count, 1)
+        XCTAssertEqual(sent.messages.first?.content.first?.text, "\n")
+    }
+}

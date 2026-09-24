@@ -404,16 +404,33 @@ extension AnthropicService: ModelService {
 extension AnthropicService {
 
     private func encode(messages: [Message]) -> [Anthropic.ChatRequest.Message] {
-        var encoded = messages
-            .filter { $0.role != .system }
-            .map { message in
-                Anthropic.ChatRequest.Message(
-                    role: encode(message.role),
-                    content: message.contents?.compactMap { encode($0) } ??
-                            message.toolCalls?.compactMap { encode($0) } ??
-                            [encode(message)].compactMap { $0 }
+        var encoded: [Anthropic.ChatRequest.Message] = []
+        for message in messages where message.role != .system {
+            let content = (message.contents?.compactMap { encode($0) } ??
+                           message.toolCalls?.compactMap { encode($0) } ??
+                           [encode(message)].compactMap { $0 })
+                // Anthropic refuses an empty text block outright — "text
+                // content blocks must be non-empty" — and refuses a message
+                // with no blocks at all, so neither is sent.
+                //
+                // They arise from stripping rather than from the model: an
+                // assistant turn that reasoned and never reached an answer is
+                // a `<think>` block and nothing else, and a caller that takes
+                // reasoning out of the history before re-sending it is left
+                // holding an empty string. Which is the right thing for the
+                // caller to do — that reasoning is working, not something the
+                // assistant said — and the right thing here is to leave out
+                // what's left rather than send a block that can't be read.
+                .filter { !($0.type == .text && ($0.text ?? "").isEmpty) }
+
+            guard !content.isEmpty else {
+                logger.info(
+                    "leaving out an empty \(message.role.rawValue, privacy: .public) message; nothing was left of it to send"
                 )
+                continue
             }
+            encoded.append(.init(role: encode(message.role), content: content))
+        }
 
         // Where the conversation so far stops and the new part begins.
         //
