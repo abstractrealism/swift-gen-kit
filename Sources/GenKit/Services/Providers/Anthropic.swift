@@ -121,10 +121,8 @@ public actor AnthropicService {
         return nil
     }
 
-    func makeRequestForTesting(model: Model, options: [String: Value]) -> Anthropic.ChatRequest {
-        var req = Anthropic.ChatRequest(model: model.id, messages: [], max_tokens: 16384)
-        applyReasoning(to: &req, options: options, model: model)
-        return req
+    func makeRequestForTesting(model: Model, options: [String: Value] = [:], messages: [Message] = []) -> Anthropic.ChatRequest {
+        makeRequest(model: model, messages: messages, options: options)
     }
 
     /// The level to ask for, given what this model says it takes.
@@ -406,7 +404,7 @@ extension AnthropicService: ModelService {
 extension AnthropicService {
 
     private func encode(messages: [Message]) -> [Anthropic.ChatRequest.Message] {
-        return messages
+        var encoded = messages
             .filter { $0.role != .system }
             .map { message in
                 Anthropic.ChatRequest.Message(
@@ -416,12 +414,42 @@ extension AnthropicService {
                             [encode(message)].compactMap { $0 }
                 )
             }
+
+        // Where the conversation so far stops and the new part begins.
+        //
+        // Every request carries the whole conversation, because the endpoint
+        // holds none of it — so a turn with eight tool rounds sends the same
+        // growing prefix eight times, and each round after the first can read
+        // what the one before it wrote instead of paying to read it again.
+        // Marked on the last block of the last message, so the prefix cached
+        // is everything up to here and the next round's prefix extends it.
+        //
+        // The economics, since a cache write costs more than an ordinary
+        // read: a write is 1.25× and a read 0.1×, so one read pays for three
+        // and a half writes. Any turn that calls a tool is several reads and
+        // wins outright; a single-round turn with no follow-up inside the
+        // cache's five minutes is the case that loses, by a quarter of the
+        // prefix. Below the minimum cacheable length the marker is ignored
+        // and nothing is charged for it.
+        //
+        // Safe on any block this encoder produces — text, image, tool_use,
+        // tool_result. A thinking block may not carry one, and none is sent:
+        // reasoning goes back folded into text, if at all.
+        if let last = encoded.indices.last, let block = encoded[last].content.indices.last {
+            encoded[last].content[block].cache_control = .init(type: .ephemeral)
+        }
+        return encoded
     }
 
     private func encodeSystemPrompt(from messages: [Message]) -> [Anthropic.ChatRequest.Message.Content]? {
         guard let message = messages.first, message.role == .system else { return nil }
         guard case .text(let text) = message.contents?.first else { return nil }
-        return [.init(type: .text, text: text)]
+        // The steadiest thing in the request, and cached first: a breakpoint
+        // here covers the tools as well, which are sent ahead of the system
+        // prompt and are the longest fixed thing in a request that offers
+        // any. Both are identical on every round of every turn for the life
+        // of a conversation, so this is read far more often than written.
+        return [.init(type: .text, text: text, cache_control: .init(type: .ephemeral))]
     }
 
     private func encode(_ role: Message.Role) -> Anthropic.ChatRequest.Message.Role {
@@ -549,6 +577,16 @@ extension AnthropicService {
         }
         if let output = usage.output_tokens {
             message.metadata["outputTokens"] = .int(output)
+        }
+        // Read from the cache, and written to it. Kept apart because they
+        // cost differently — a read is a tenth of an ordinary input token, a
+        // write a quarter more — and because together they say whether the
+        // caching is doing anything at all.
+        if let read = usage.cache_read_input_tokens, read > 0 {
+            message.metadata["cachedTokens"] = .int(read)
+        }
+        if let written = usage.cache_creation_input_tokens, written > 0 {
+            message.metadata["cacheWriteTokens"] = .int(written)
         }
     }
 
