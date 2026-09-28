@@ -56,6 +56,65 @@ final class OpenAIUsageRecordingTests: XCTestCase {
         XCTAssertNil(message.metadata["outputSeconds"])
     }
 
+    /// Grok reports reasoning apart from the completion where everything else
+    /// reports it within.
+    ///
+    /// Measured on 28 Sept 2026 against `api.x.ai`: 306 completion tokens and
+    /// 1,396 reasoning ones. Read as a share of the output that made the
+    /// answer −1,090 tokens long, which is how it was noticed. The totals are
+    /// what settle it — `total_tokens` here accounts for all three figures,
+    /// where OpenAI's accounts for two.
+    private static let grokChunk = #"""
+    {"id":"x","object":"chat.completion.chunk","created":1,"model":"grok-4","choices":[],"usage":{"prompt_tokens":832,"completion_tokens":306,"total_tokens":2534,"completion_tokens_details":{"reasoning_tokens":1396}}}
+    """#
+
+    func testGrokReasoningIsAddedToTheOutputRatherThanTakenFromIt() throws {
+        var message = Message(role: .assistant)
+        service.patchMessage(&message, with: try chunk(Self.grokChunk))
+
+        XCTAssertEqual(message.metadata["inputTokens"]?.intValue, 832)
+        XCTAssertEqual(message.metadata["reasoningTokens"]?.intValue, 1396)
+        XCTAssertEqual(
+            message.metadata["outputTokens"]?.intValue, 1702,
+            "the completion plus the reasoning, since the service's total counts both"
+        )
+
+        // The thing that was actually wrong on screen: what's left for the
+        // answer once the reasoning is taken out.
+        let output = try XCTUnwrap(message.metadata["outputTokens"]?.intValue)
+        let reasoning = try XCTUnwrap(message.metadata["reasoningTokens"]?.intValue)
+        XCTAssertEqual(output - reasoning, 306, "the answer, and not a negative number")
+    }
+
+    /// The same shape from OpenAI, where the total accounts for two figures
+    /// rather than three, must not be touched.
+    func testOpenAIReasoningStaysAShareOfTheOutput() throws {
+        var message = Message(role: .assistant)
+        service.patchMessage(&message, with: try chunk(Self.usageOnlyChunk))
+        XCTAssertEqual(message.metadata["outputTokens"]?.intValue, 30, "unchanged: 20 + 30 == 50")
+        XCTAssertEqual(message.metadata["reasoningTokens"]?.intValue, 12)
+    }
+
+    /// With no total to go on, the sizes decide — reasoning larger than the
+    /// completion cannot be a part of it.
+    func testWithoutATotalTheLargerReasoningIsTakenAsExtra() throws {
+        let extra = #"""
+        {"id":"x","object":"chat.completion.chunk","created":1,"model":"grok-4","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":40,"completion_tokens_details":{"reasoning_tokens":900}}}
+        """#
+        var message = Message(role: .assistant)
+        service.patchMessage(&message, with: try chunk(extra))
+        XCTAssertEqual(message.metadata["outputTokens"]?.intValue, 940)
+
+        // And the other way: reasoning that fits inside the completion is
+        // left where it is, because it can be a share of it.
+        let within = #"""
+        {"id":"x","object":"chat.completion.chunk","created":1,"model":"gpt-5.6-sol","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":900,"completion_tokens_details":{"reasoning_tokens":40}}}
+        """#
+        var other = Message(role: .assistant)
+        service.patchMessage(&other, with: try chunk(within))
+        XCTAssertEqual(other.metadata["outputTokens"]?.intValue, 900)
+    }
+
     /// A stream reports usage on one chunk out of thousands, and the patch
     /// runs on all of them. What arrived must not be undone by what follows.
     func testALaterChunkDoesNotEraseWhatWasRecorded() throws {
