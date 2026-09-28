@@ -773,6 +773,41 @@ extension OpenAIService {
     ///
     /// Each field is written only when it arrives. A stream reports usage on
     /// one chunk out of thousands, and this runs on all of them.
+    /// Whether `reasoning_tokens` is additional to `completion_tokens` rather
+    /// than counted inside it.
+    ///
+    /// OpenAI, Groq and DeepSeek count reasoning within the completion, and
+    /// this assumed everyone did. Grok does not. Measured 28 Sept 2026: a
+    /// reply reporting 306 completion tokens against 1,396 reasoning ones,
+    /// which cannot be a share of them — the app subtracted one from the
+    /// other and displayed an answer of −1,090 tokens.
+    ///
+    /// Decided from the service's own total rather than from a table of who
+    /// does what. `total_tokens` either accounts for the reasoning on top of
+    /// the completion or it doesn't, and that is this question put to the
+    /// only party that knows — the same reason the model capabilities are
+    /// now read from each provider's list instead of being written down here
+    /// and going quietly out of date.
+    ///
+    /// Where there is no total, or it agrees with neither sum, the sizes
+    /// decide: reasoning larger than the completion cannot be inside it.
+    /// That leaves one case undetectable — a service reporting them apart
+    /// where the reasoning happens to be the smaller — which is why the
+    /// total is asked first and the comparison is only the fallback.
+    nonisolated private func reasoningIsExtra(_ usage: OpenAI.Usage) -> Bool {
+        guard let reasoning = usage.completion_tokens_details?.reasoning_tokens, reasoning > 0,
+              let completion = usage.completion_tokens
+        else {
+            return false
+        }
+
+        if let total = usage.total_tokens, let prompt = usage.prompt_tokens {
+            if total == prompt + completion + reasoning { return true }
+            if total == prompt + completion { return false }
+        }
+        return reasoning > completion
+    }
+
     nonisolated private func record(usage: OpenAI.Usage?, model: String?, into message: inout Message) {
         // Which model actually answered. Reported on every chunk, and worth
         // keeping per message: a conversation can change model between
@@ -786,7 +821,14 @@ extension OpenAIService {
             message.metadata["inputTokens"] = .int(input)
         }
         if let output = usage.completion_tokens {
-            message.metadata["outputTokens"] = .int(output)
+            // Everything generated, reasoning included. Usually that is
+            // `completion_tokens` unchanged, reasoning being a share of it.
+            // Where a service reports the two apart they have to be added, or
+            // the reply carries more reasoning than output and a caller
+            // splitting one from the other gets a negative answer.
+            let reasoning = usage.completion_tokens_details?.reasoning_tokens ?? 0
+            message.metadata["outputTokens"] =
+                .int(reasoningIsExtra(usage) ? output + reasoning : output)
         }
         // Generation alone, where timing the request from outside would also
         // count the wait in the queue. Groq reports it; nothing else does, so
@@ -794,8 +836,8 @@ extension OpenAIService {
         if let seconds = usage.completion_time, seconds > 0 {
             message.metadata["outputSeconds"] = .double(seconds)
         }
-        // Reasoning is part of what was generated and is counted in the
-        // output, so it's kept as a share of it rather than added on.
+        // Reasoning as a share of the output, `outputTokens` above having
+        // been made to include it either way.
         //
         // Under its own name, not `thinkingTokens`: that one is a caller's
         // estimate for services that report no such figure, apportioned from
