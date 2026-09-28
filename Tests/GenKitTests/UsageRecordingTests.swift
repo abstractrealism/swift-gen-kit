@@ -95,6 +95,22 @@ final class OpenAIUsageRecordingTests: XCTestCase {
         XCTAssertEqual(message.metadata["reasoningTokens"]?.intValue, 12)
     }
 
+    /// The sizes outrank the total, because they are arithmetic and it is
+    /// convention. Grok's own total was never captured — the figure on screen
+    /// was Heat's own sum — so a service that reports reasoning separately
+    /// while totalling as though it hadn't must still come out right.
+    func testReasoningLargerThanTheCompletionWinsOverAnAgreeableTotal() throws {
+        let json = #"""
+        {"id":"x","object":"chat.completion.chunk","created":1,"model":"grok-4","choices":[],"usage":{"prompt_tokens":832,"completion_tokens":306,"total_tokens":1138,"completion_tokens_details":{"reasoning_tokens":1396}}}
+        """#
+        var message = Message(role: .assistant)
+        service.patchMessage(&message, with: try chunk(json))
+        XCTAssertEqual(
+            message.metadata["outputTokens"]?.intValue, 1702,
+            "1,396 cannot be part of 306, whatever the total claims"
+        )
+    }
+
     /// With no total to go on, the sizes decide — reasoning larger than the
     /// completion cannot be a part of it.
     func testWithoutATotalTheLargerReasoningIsTakenAsExtra() throws {

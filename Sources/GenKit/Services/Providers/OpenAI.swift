@@ -801,11 +801,22 @@ extension OpenAIService {
             return false
         }
 
+        // Asked first because it is arithmetic rather than convention: a
+        // count larger than the completion cannot be a part of it, whatever
+        // any other field says. Put after the totals, a service reporting
+        // `total == prompt + completion` while counting reasoning separately
+        // would have been read as agreeing with OpenAI — which is precisely
+        // the case this exists for, and it is not known which way Grok's
+        // total falls.
+        if reasoning > completion { return true }
+
+        // For the rest, where the reasoning would fit inside the completion
+        // and the sizes prove nothing, the service's total says which it
+        // meant.
         if let total = usage.total_tokens, let prompt = usage.prompt_tokens {
             if total == prompt + completion + reasoning { return true }
-            if total == prompt + completion { return false }
         }
-        return reasoning > completion
+        return false
     }
 
     nonisolated private func record(usage: OpenAI.Usage?, model: String?, into message: inout Message) {
