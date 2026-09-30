@@ -161,12 +161,21 @@ extension MistralService {
 
     private func decode(_ resp: Mistral.ChatResponse) -> Message? {
         guard let choice = resp.choices.first else { return nil }
-        return Message(
+        var message = Message(
             role: .assistant,
             content: choice.message.content,
             toolCalls: choice.message.tool_calls?.map { decode($0) },
             finishReason: decode(choice.finish_reason)
         )
+        // The counts arrive here in one piece rather than on a final chunk,
+        // but they are the same figures under the same names.
+        record(
+            inputTokens: resp.usage?.prompt_tokens,
+            outputTokens: resp.usage?.completion_tokens,
+            model: resp.model,
+            into: &message
+        )
+        return message
     }
     
     private func decode(_ toolCall: Mistral.ChatResponse.Choice.Message.ToolCall) -> ToolCall {
@@ -195,6 +204,41 @@ extension MistralService {
         }
     }
     
+    /// What the reply cost, under the provider-neutral names the other
+    /// providers use.
+    ///
+    /// Nothing recorded this, so a Mistral reply arrived with no counts and
+    /// no model against it and the signature line showed nothing — the same
+    /// gap the OpenAI and Anthropic providers had. Mistral has been reporting
+    /// all of it the whole time; `swift-mistral` decodes `prompt_tokens`,
+    /// `completion_tokens` and `total_tokens`, and nothing here read them.
+    ///
+    /// Each field written only when it arrives, because this runs on every
+    /// chunk of a stream and the totals come on one of them.
+    ///
+    /// No reasoning split: Mistral reports no such figure, so the caller's
+    /// estimate from the stream stands where a model has been reasoning.
+    /// Takes the figures rather than either response's `Usage`, which are two
+    /// different types describing the same three numbers — and whose
+    /// memberwise initialisers aren't public, so one could not be built to
+    /// stand in for the other.
+    nonisolated private func record(inputTokens: Int?, outputTokens: Int?, model: String?, into message: inout Message) {
+        // Which model answered, on every chunk, and worth keeping per message
+        // because a conversation can change model between messages.
+        if let model, !model.isEmpty {
+            message.metadata["model"] = .string(model)
+        }
+        // Only what arrived. Writing zeros where a response carried no usage
+        // would put "0 tokens" on screen, which reads as a measurement rather
+        // than as the absence of one.
+        if let inputTokens {
+            message.metadata["inputTokens"] = .int(inputTokens)
+        }
+        if let outputTokens {
+            message.metadata["outputTokens"] = .int(outputTokens)
+        }
+    }
+
     private func decode(_ model: Mistral.ModelsResponse.Model) -> Model {
         Model(
             id: model.id,
@@ -206,7 +250,7 @@ extension MistralService {
         )
     }
     
-    private func decode(_ reason: Mistral.ChatStreamResponse.Choice.FinishReason?) -> Message.FinishReason? {
+    nonisolated private func decode(_ reason: Mistral.ChatStreamResponse.Choice.FinishReason?) -> Message.FinishReason? {
         guard let reason else { return nil }
         switch reason {
         case .stop:
@@ -220,7 +264,7 @@ extension MistralService {
         }
     }
     
-    private func decode(_ toolCall: Mistral.ChatStreamResponse.Choice.Message.ToolCall) -> ToolCall {
+    nonisolated private func decode(_ toolCall: Mistral.ChatStreamResponse.Choice.Message.ToolCall) -> ToolCall {
         ToolCall(
             id: toolCall.id ?? "",
             type: "function",
@@ -232,7 +276,22 @@ extension MistralService {
         )
     }
     
-    private func patchMessage(_ message: inout Message, with resp: Mistral.ChatStreamResponse) {
+    /// Internal rather than private so a test can drive it with a chunk,
+    /// which is how the OpenAI provider's counts are covered. The interesting
+    /// case has no choices at all and cannot be reached any other way.
+    nonisolated func patchMessage(_ message: inout Message, with resp: Mistral.ChatStreamResponse) {
+        // Before the guard below, deliberately. A stream reports its totals on
+        // a chunk that carries no choices at all, so read after that guard
+        // they were never read — which is how every hosted service but Ollama
+        // came to answer with no counts against it, and how the same mistake
+        // was found in the OpenAI provider.
+        record(
+            inputTokens: resp.usage?.prompt_tokens,
+            outputTokens: resp.usage?.completion_tokens,
+            model: resp.model,
+            into: &message
+        )
+
         // If there is no choice, return existing message
         guard let choice = resp.choices.first else {
             return

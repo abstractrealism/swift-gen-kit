@@ -199,3 +199,59 @@ final class AnthropicUsageRecordingTests: XCTestCase {
         XCTAssertEqual(message.metadata["outputTokens"]?.intValue, 14)
     }
 }
+
+import Mistral
+
+/// Mistral has its own provider rather than going through the OpenAI one
+/// with a dialect, so none of the counting added there reached it: a reply
+/// arrived with no tokens and no model against it and the signature line
+/// showed nothing. Mistral had been reporting all of it the whole time.
+final class MistralUsageRecordingTests: XCTestCase {
+
+    private let service = MistralService(apiKey: "test")
+
+    private func chunk(_ json: String) throws -> Mistral.ChatStreamResponse {
+        try JSONDecoder().decode(Mistral.ChatStreamResponse.self, from: Data(json.utf8))
+    }
+
+    func testTheModelIsRecordedFromTheFirstChunk() throws {
+        let json = #"""
+        {"id":"x","object":"chat.completion.chunk","model":"mistral-large-latest","choices":[{"index":0,"delta":{"content":"Hel"}}]}
+        """#
+        var message = Message(role: .assistant)
+        service.patchMessage(&message, with: try chunk(json))
+
+        XCTAssertEqual(message.metadata["model"]?.stringValue, "mistral-large-latest")
+        XCTAssertNil(message.metadata["outputTokens"], "nothing to report until usage arrives")
+    }
+
+    /// The case that made this worth testing rather than just writing. The
+    /// totals ride on a chunk with an empty choices array, and `patchMessage`
+    /// returns early when there is no choice — so anything read after that
+    /// guard is never read at all. That is precisely how the OpenAI provider
+    /// came to drop its counts, and this provider had the same shape.
+    func testACountOnlyChunkWithNoChoicesIsStillRead() throws {
+        let json = #"""
+        {"id":"x","object":"chat.completion.chunk","model":"mistral-large-latest","choices":[],"usage":{"prompt_tokens":91,"completion_tokens":240,"total_tokens":331}}
+        """#
+        var message = Message(role: .assistant)
+        service.patchMessage(&message, with: try chunk(json))
+
+        XCTAssertEqual(message.metadata["inputTokens"]?.intValue, 91)
+        XCTAssertEqual(message.metadata["outputTokens"]?.intValue, 240)
+        XCTAssertEqual(message.metadata["model"]?.stringValue, "mistral-large-latest")
+    }
+
+    /// A response carrying no usage writes none. Zeros would put "0 tokens"
+    /// on screen, which reads as a measurement rather than the absence of one.
+    func testNoUsageWritesNoCounts() throws {
+        let json = #"""
+        {"id":"x","object":"chat.completion.chunk","model":"mistral-large-latest","choices":[{"index":0,"delta":{"content":"lo"}}]}
+        """#
+        var message = Message(role: .assistant)
+        service.patchMessage(&message, with: try chunk(json))
+
+        XCTAssertNil(message.metadata["inputTokens"])
+        XCTAssertNil(message.metadata["outputTokens"])
+    }
+}
