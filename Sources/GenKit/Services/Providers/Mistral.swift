@@ -63,8 +63,53 @@ extension MistralService: EmbeddingService {
 extension MistralService: ModelService {
     
     public func models() async throws -> [Model] {
-        let result = try await client.models()
-        return result.data.map { decode($0) }
+        decodeModels(try await client.models())
+    }
+
+    /// Everything `models()` does except the request, so the alias folding
+    /// and the capability reading can be driven from a captured response.
+    nonisolated func decodeModels(_ response: Mistral.ModelsResponse) -> [Model] {
+        deduplicated(response.data).map { decode($0) }
+    }
+
+    /// One entry per model, where Mistral lists one per alias.
+    ///
+    /// Measured 1 Oct 2026 against `api.mistral.ai`: **53 entries, 20 distinct
+    /// names**, and within every group sharing a name the context length and
+    /// the capabilities were identical — only `id` differed. So
+    /// `codestral-2508`, `codestral-latest`, `mistral-code-latest` and
+    /// `mistral-code-fim-latest` are four ways to address one model, and
+    /// `mistral-medium-latest` had nine, including `magistral-medium-latest`
+    /// and `mistral-vibe-cli-latest`. Settings showed all of them, under
+    /// identical labels, because the list displays `name`.
+    ///
+    /// Which one to keep is the provider's answer rather than a rule invented
+    /// here: in every one of those groups exactly one entry had `id == name`,
+    /// `name` being Mistral's own canonical label. That does mean the choice
+    /// between a pinned id and a floating `-latest` follows Mistral's
+    /// inconsistency — `mistral-large-2512` is canonical where
+    /// `mistral-medium-latest` is — which is the right way round: reporting
+    /// what the service says beats deciding on its behalf.
+    ///
+    /// Entries with no name are kept as they are, having nothing to group by.
+    nonisolated private func deduplicated(_ models: [Mistral.ModelsResponse.Model]) -> [Mistral.ModelsResponse.Model] {
+        var byName: [String: Mistral.ModelsResponse.Model] = [:]
+        var order: [String] = []
+        var unnamed: [Mistral.ModelsResponse.Model] = []
+
+        for model in models {
+            guard let name = model.name else {
+                unnamed.append(model)
+                continue
+            }
+            if byName[name] == nil {
+                order.append(name)
+                byName[name] = model
+            } else if model.id == name {
+                byName[name] = model
+            }
+        }
+        return order.compactMap { byName[$0] } + unnamed
     }
 }
 
@@ -239,15 +284,43 @@ extension MistralService {
         }
     }
 
-    private func decode(_ model: Mistral.ModelsResponse.Model) -> Model {
+    nonisolated private func decode(_ model: Mistral.ModelsResponse.Model) -> Model {
         Model(
             id: model.id,
             name: model.name,
             owner: model.owned_by ?? "mistral",
             contextWindow: model.max_context_length,
-            maxOutput: model.max_context_length,
-            trainingCutoff: nil
+            // Mistral reports no output limit, and this used to report the
+            // context window as one — so Longest Reply offered a 262,144-token
+            // ceiling on a model whose answers are nothing like that. Nil says
+            // "not published", which is true, and the clamp that reads this
+            // simply doesn't apply.
+            maxOutput: nil,
+            trainingCutoff: nil,
+            capabilities: decode(model.capabilities)
         )
+    }
+
+    /// What the service says each model is for.
+    ///
+    /// Mistral reports this per model and nothing read it, so its embedding,
+    /// OCR, transcription and speech models all appeared in the chat picker —
+    /// seven of the twenty, once the aliases above are folded together.
+    ///
+    /// `fine_tuning` has no counterpart here and is dropped. **`reasoning`
+    /// has one — `.thinking` — and cannot be read yet**: Mistral sends it,
+    /// and it is true of `mistral-medium-latest`, `mistral-small-2603`,
+    /// `glm-5-2`, `zai-glm-5-3` and `labs-leanstral-1-5-1`, but
+    /// `swift-mistral`'s `Capabilities` decodes only five keys and that is
+    /// not one of them. Reading it needs a change there, not here.
+    nonisolated private func decode(_ capabilities: Mistral.ModelsResponse.Model.Capabilities?) -> Set<Model.Capability>? {
+        guard let capabilities else { return nil }
+        var found: Set<Model.Capability> = []
+        if capabilities.completion_chat { found.insert(.completion) }
+        if capabilities.function_calling { found.insert(.tools) }
+        if capabilities.vision { found.insert(.vision) }
+        if capabilities.completion_fim { found.insert(.insert) }
+        return found
     }
     
     nonisolated private func decode(_ reason: Mistral.ChatStreamResponse.Choice.FinishReason?) -> Message.FinishReason? {
