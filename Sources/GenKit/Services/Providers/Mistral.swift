@@ -307,12 +307,17 @@ extension MistralService {
     /// OCR, transcription and speech models all appeared in the chat picker —
     /// seven of the twenty, once the aliases above are folded together.
     ///
-    /// `fine_tuning` has no counterpart here and is dropped. **`reasoning`
-    /// has one — `.thinking` — and cannot be read yet**: Mistral sends it,
-    /// and it is true of `mistral-medium-latest`, `mistral-small-2603`,
-    /// `glm-5-2`, `zai-glm-5-3` and `labs-leanstral-1-5-1`, but
-    /// `swift-mistral`'s `Capabilities` decodes only five keys and that is
-    /// not one of them. Reading it needs a change there, not here.
+    /// `reasoning` is true of five of the twenty — `mistral-medium-latest`,
+    /// `mistral-small-2603`, `glm-5-2`, `zai-glm-5-3` and
+    /// `labs-leanstral-1-5-1` — and could not be read until `swift-mistral`
+    /// decoded it, because guessing from the name is worse than useless here:
+    /// `magistral-medium-latest` is an alias of `mistral-medium-latest`, so
+    /// the model that sounds like the reasoning one and the model that is it
+    /// are the same thing under two names.
+    ///
+    /// `fine_tuning` has no counterpart here and is dropped, as are the OCR
+    /// and audio keys — a model is kept out of the chat list by what it
+    /// *lacks*, `completion_chat`, rather than by what else it can do.
     nonisolated private func decode(_ capabilities: Mistral.ModelsResponse.Model.Capabilities?) -> Set<Model.Capability>? {
         guard let capabilities else { return nil }
         var found: Set<Model.Capability> = []
@@ -320,6 +325,9 @@ extension MistralService {
         if capabilities.function_calling { found.insert(.tools) }
         if capabilities.vision { found.insert(.vision) }
         if capabilities.completion_fim { found.insert(.insert) }
+        // Optional upstream, because a key absent from one model's response
+        // would otherwise fail the decode for every model in it.
+        if capabilities.reasoning == true { found.insert(.thinking) }
         return found
     }
     

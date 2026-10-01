@@ -77,6 +77,38 @@ final class MistralModelsTests: XCTestCase {
         )
     }
 
+    /// Magistral became an alias of mistral-medium rather than a model of its
+    /// own, so the model that *sounds* like the reasoning one and the model
+    /// that *is* it are the same thing under two names. Guessing from the
+    /// name is therefore worse than useless, and this is why `reasoning` had
+    /// to be decoded upstream before it could be read here.
+    func testReasoningIsReadWhereTheServiceReportsIt() throws {
+        let json = #"""
+        {"object":"list","data":[
+          {"id":"mistral-medium-latest","name":"mistral-medium-latest","max_context_length":262144,"capabilities":{"completion_chat":true,"completion_fim":false,"function_calling":true,"fine_tuning":false,"vision":true,"reasoning":true}},
+          {"id":"ministral-3b-2512","name":"ministral-3b-2512","max_context_length":131072,"capabilities":{"completion_chat":true,"completion_fim":false,"function_calling":true,"fine_tuning":true,"vision":true,"reasoning":false}}
+        ]}
+        """#
+        let decoded = try models(json)
+        XCTAssertEqual(decoded.first(where: { $0.id == "mistral-medium-latest" })?.capabilities?.contains(.thinking), true)
+        XCTAssertEqual(decoded.first(where: { $0.id == "ministral-3b-2512" })?.capabilities?.contains(.thinking), false)
+    }
+
+    /// The whole reason the new keys are optional upstream. A response with
+    /// none of them must still decode — otherwise one model that happens not
+    /// to report `reasoning` takes every other model down with it, and the
+    /// service list comes back empty rather than merely incomplete.
+    func testAResponseWithoutTheNewerKeysStillDecodes() throws {
+        let json = #"""
+        {"object":"list","data":[
+          {"id":"mistral-small-2603","name":"mistral-small-2603","max_context_length":262144,"capabilities":{"completion_chat":true,"completion_fim":false,"function_calling":true,"fine_tuning":false,"vision":true}}
+        ]}
+        """#
+        let decoded = try models(json)
+        XCTAssertEqual(decoded.count, 1)
+        XCTAssertEqual(decoded.first?.capabilities, [.completion, .tools, .vision], "no thinking claimed where none is reported")
+    }
+
     /// Mistral publishes no output limit, and this used to report the context
     /// window as one — so Longest Reply offered a 262,144-token ceiling.
     func testNoOutputCeilingIsClaimed() throws {
