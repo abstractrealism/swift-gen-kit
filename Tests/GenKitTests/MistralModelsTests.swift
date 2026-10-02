@@ -117,3 +117,70 @@ final class MistralModelsTests: XCTestCase {
         XCTAssertNil(decoded.first?.maxOutput, "not published, so not claimed")
     }
 }
+
+/// The reasoning models send content as typed blocks where the rest send a
+/// string — and `zai-glm-5-3` sends both in one stream, two chunks of
+/// `"content": ""` before the first block arrives. Declared `String?`, that
+/// failed the decode on the third chunk and took the whole generation with
+/// it, reporting only to the screen.
+///
+/// Chunks verbatim from a live stream of 2 October 2026.
+final class MistralBlockContentTests: XCTestCase {
+
+    private let service = MistralService(apiKey: "test")
+
+    private func chunk(_ json: String) throws -> Mistral.ChatStreamResponse {
+        try JSONDecoder().decode(Mistral.ChatStreamResponse.self, from: Data(json.utf8))
+    }
+
+    private static let plain = #"""
+    {"id":"x","object":"chat.completion.chunk","created":1,"model":"zai-glm-5-3","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}
+    """#
+
+    private static let firstThought = #"""
+    {"id":"x","object":"chat.completion.chunk","created":1,"model":"zai-glm-5-3","choices":[{"index":0,"delta":{"index":0,"content":[{"type":"thinking","thinking":[{"type":"text","text":"The"}],"closed":true}]},"finish_reason":null,"logprobs":null}]}
+    """#
+
+    private static let moreThought = #"""
+    {"id":"x","object":"chat.completion.chunk","created":1,"model":"zai-glm-5-3","choices":[{"index":0,"delta":{"index":0,"content":[{"type":"thinking","thinking":[{"type":"text","text":" user is asking for a"}],"closed":true}]},"finish_reason":null,"logprobs":null}]}
+    """#
+
+    private static let answer = #"""
+    {"id":"x","object":"chat.completion.chunk","created":1,"model":"zai-glm-5-3","choices":[{"index":0,"delta":{"index":0,"content":[{"type":"text","text":"391"}]},"finish_reason":null,"logprobs":null}]}
+    """#
+
+    /// The decode itself, which is what actually broke.
+    func testAStreamMixingStringAndBlockContentDecodes() throws {
+        XCTAssertNoThrow(try chunk(Self.plain))
+        XCTAssertNoThrow(try chunk(Self.firstThought))
+    }
+
+    /// Reasoning accumulates under its own key and the content is rebuilt
+    /// from both halves, as it is for Ollama and OpenAI, so a reader needn't
+    /// know which provider answered.
+    func testReasoningAccumulatesAndTheAnswerFollowsIt() throws {
+        var message = Message(role: .assistant)
+        service.patchMessage(&message, with: try chunk(Self.plain))
+        service.patchMessage(&message, with: try chunk(Self.firstThought))
+        service.patchMessage(&message, with: try chunk(Self.moreThought))
+
+        XCTAssertEqual(message.metadata["thinking"]?.stringValue, "The user is asking for a")
+        XCTAssertEqual(message.content, "<think>\nThe user is asking for a", "left open until the answer starts")
+
+        service.patchMessage(&message, with: try chunk(Self.answer))
+        XCTAssertEqual(message.metadata["answer"]?.stringValue, "391")
+        XCTAssertEqual(message.content, "<think>\nThe user is asking for a\n</think>\n391")
+    }
+
+    /// A model that sends a plain string is unaffected — no `<think>` wrapper
+    /// appears around an answer that never had reasoning beside it.
+    func testPlainStringContentIsUntouched() throws {
+        let hello = #"""
+        {"id":"x","object":"chat.completion.chunk","created":1,"model":"mistral-medium-latest","choices":[{"index":0,"delta":{"content":"17 × 2"},"finish_reason":null}]}
+        """#
+        var message = Message(role: .assistant)
+        service.patchMessage(&message, with: try chunk(hello))
+        XCTAssertEqual(message.content, "17 × 2")
+        XCTAssertNil(message.metadata["thinking"])
+    }
+}

@@ -230,7 +230,10 @@ extension MistralService {
         guard let choice = resp.choices.first else { return nil }
         var message = Message(
             role: .assistant,
-            content: choice.message.content,
+            content: compose(
+                thinking: choice.message.content?.thinking ?? "",
+                answer: choice.message.content?.text ?? ""
+            ),
             toolCalls: choice.message.tool_calls?.map { decode($0) },
             finishReason: decode(choice.finish_reason)
         )
@@ -271,6 +274,18 @@ extension MistralService {
         }
     }
     
+    /// Folds reasoning into the content as a `<think>` block.
+    ///
+    /// The shape Ollama's and OpenAI's reasoning already take, so a reader
+    /// needn't know which provider a reply came from. Left open until the
+    /// answer starts, so a reader streaming the reply can tell reasoning from
+    /// answer as it arrives.
+    nonisolated private func compose(thinking: String, answer: String) -> String {
+        guard !thinking.isEmpty else { return answer }
+        let closing = answer.isEmpty ? "" : "\n</think>\n"
+        return "<think>\n" + thinking + closing + answer
+    }
+
     /// What the reply cost, under the provider-neutral names the other
     /// providers use.
     ///
@@ -400,12 +415,26 @@ extension MistralService {
             return
         }
 
-        // Patch message content
-        if case .text(let text) = message.contents?.last, let delta = choice.delta.content {
+        // Reasoning and answer arrive as separate blocks on the models that
+        // reason, so each is accumulated and the pair rebuilt every time —
+        // the same thing the Ollama provider does with its own two fields.
+        // Accumulated under their own keys rather than patched into the
+        // composed text, because the `<think>` wrapper has to be rebuilt as
+        // the answer starts and can't be appended to.
+        if let delta = choice.delta.content, delta.thinking != nil || message.metadata["thinking"] != nil {
+            let thinking = (message.metadata["thinking"]?.stringValue ?? "") + (delta.thinking ?? "")
+            let answer = (message.metadata["answer"]?.stringValue ?? "") + (delta.text ?? "")
+
+            message.metadata["thinking"] = .string(thinking)
+            message.metadata["answer"] = .string(answer)
+            message.contents = [.text(compose(thinking: thinking, answer: answer))]
+
+        // Everything else: a plain string, patched as before.
+        } else if case .text(let text) = message.contents?.last, let delta = choice.delta.content?.text {
             if let patched = GenKit.patch(string: text, with: delta) {
                 message.contents = [.text(patched)]
             }
-        } else if let delta = choice.delta.content {
+        } else if let delta = choice.delta.content?.text {
             message.contents = [.text(delta)]
         }
 
