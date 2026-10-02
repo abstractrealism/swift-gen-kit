@@ -26,7 +26,15 @@ extension MistralService: ChatService {
         )
         req.temperature = request.options["temperature"]?.doubleValue
 
-        let resp = try await client.chatCompletions(req)
+        logger.info("→ mistral completion | model: \(req.model, privacy: .public) | messages: \(req.messages.count, privacy: .public) | tools: \(req.tools?.count ?? 0, privacy: .public)")
+
+        let resp: Mistral.ChatResponse
+        do {
+            resp = try await client.chatCompletions(req)
+        } catch {
+            logger.error("← mistral completion failed: \(error, privacy: .public)")
+            throw error
+        }
         guard let message = decode(resp) else {
             throw ChatServiceError.responseError("Missing response choice")
         }
@@ -43,11 +51,25 @@ extension MistralService: ChatService {
         req.temperature = request.options["temperature"]?.doubleValue
         req.stream = true
         
+        logger.info("→ mistral stream | model: \(req.model, privacy: .public) | messages: \(req.messages.count, privacy: .public) | tools: \(req.tools?.count ?? 0, privacy: .public)")
+
+        // Counted so a failure says how far it got. A stream that dies on its
+        // first chunk and one that dies near the end are different problems,
+        // and the decode failure that prompted this reached the screen with
+        // nothing in the log to say where it happened.
+        var chunks = 0
         var message = Message(role: .assistant)
-        for try await resp in try client.chatCompletionsStream(req) {
-            patchMessage(&message, with: resp)
-            try await update(message)
+        do {
+            for try await resp in try client.chatCompletionsStream(req) {
+                chunks += 1
+                patchMessage(&message, with: resp)
+                try await update(message)
+            }
+        } catch {
+            logger.error("← mistral stream failed after \(chunks, privacy: .public) chunks: \(error, privacy: .public)")
+            throw error
         }
+        logger.info("← mistral stream finished | \(chunks, privacy: .public) chunks")
     }
 }
 
