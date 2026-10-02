@@ -200,6 +200,34 @@ extension Service {
     ///
     /// Nil where nothing is known — an unrecognised model, or a service that
     /// doesn't distinguish. Only `false` is a fact worth acting on.
+    /// Asks this service which reasoning efforts a model accepts.
+    ///
+    /// Only for the services whose reasoning is a `reasoning_effort` string on
+    /// an OpenAI-shaped request, which is all of them bar Anthropic and
+    /// Ollama. Anthropic is deliberately left out: its open question is
+    /// whether a model can be told *not* to think, which is one boolean that
+    /// matters only when a request goes out — so it is better learned from
+    /// that request being refused than by asking every model in advance.
+    /// Ollama's reasoning is a local matter with no such parameter.
+    ///
+    /// `.failed` where there is nothing to ask, so a caller treats it the
+    /// same as a question that didn't get through and doesn't remember a
+    /// non-answer.
+    public func probeReasoningLevels(modelID: String, session: URLSession? = nil) async -> ReasoningProbe.Outcome {
+        switch kind {
+        case .openAI, .deepseek, .grok, .groq, .mistral, .openRouter:
+            guard let hostURL, !token.isEmpty else { return .failed }
+            return await ReasoningProbe.ask(
+                host: hostURL,
+                token: token,
+                modelID: modelID,
+                session: session ?? .shared
+            )
+        default:
+            return .failed
+        }
+    }
+
     public func canDisableThinking(modelID: String) -> Bool? {
         switch kind {
         case .anthropic:
