@@ -58,6 +58,20 @@ final class ReasoningProbeTests: XCTestCase {
         XCTAssertEqual(ReasoningProbe.levels(in: body), [])
     }
 
+    /// Knowable before asking, so a caller can skip a service entirely
+    /// rather than discovering it from a `.failed` it can't tell apart from
+    /// a service it couldn't reach.
+    func testWhetherThereIsAnythingToAskIsKnownUpFront() {
+        for kind in [Service.Kind.openAI, .deepseek, .grok, .groq, .mistral, .openRouter] {
+            let service = Service(kind: kind, name: "\(kind)", host: "https://example.invalid/v1", token: "t")
+            XCTAssertTrue(service.canProbeReasoningLevels, "\(kind) takes reasoning_effort")
+        }
+        for kind in [Service.Kind.anthropic, .ollama, .elevenLabs, .fal] {
+            let service = Service(kind: kind, name: "\(kind)", host: "https://example.invalid/v1", token: "t")
+            XCTAssertFalse(service.canProbeReasoningLevels, "\(kind) has no such parameter")
+        }
+    }
+
     func testOnlyTheServicesWithSuchAParameterAreAsked() async {
         let anthropic = Service(id: "a", kind: .anthropic, name: "Anthropic", host: "https://api.anthropic.com/v1", token: "t")
         let ollama = Service(id: "o", kind: .ollama, name: "Ollama", host: "http://localhost:11434/v1", token: "t")
