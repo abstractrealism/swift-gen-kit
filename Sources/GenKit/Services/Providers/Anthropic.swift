@@ -14,12 +14,45 @@ public actor AnthropicService {
         self.client = .init(session: session, host: host, apiKey: apiKey)
     }
 
+    /// Models that refused to be told not to think.
+    ///
+    /// `canDisable` is the one thing Anthropic's model list doesn't report —
+    /// nothing in it distinguishes a model that takes
+    /// `thinking: {type: "disabled"}` from one that rejects it — so it is
+    /// assumed true for any model the table doesn't name, and a model that
+    /// reasons unconditionally fails the turn until somebody edits the table.
+    ///
+    /// This is the refusal being used instead of waiting for that edit. It
+    /// is deliberately **not** probed on Load Models the way reasoning levels
+    /// are: this is a single boolean that only matters when a request goes
+    /// out, where a level list has to fill a picker before anybody chooses.
+    /// Asking every model in advance would spend requests to learn something
+    /// the first real request teaches for free.
+    ///
+    /// In memory rather than on disk, so it is learned once per launch. The
+    /// cost of forgetting is one request that is retried and succeeds, which
+    /// nobody sees; storing it would mean a persistence path through gen-kit
+    /// for a boolean that costs a round trip.
+    private actor ThinkingRefusals {
+        static let shared = ThinkingRefusals()
+        private var models: Set<String> = []
+
+        func remember(_ modelID: String) {
+            models.insert(modelID)
+        }
+
+        func refused(_ modelID: String) -> Bool {
+            models.contains(modelID)
+        }
+    }
+
     private func makeRequest(
         model: Model,
         messages: [Message],
         tools: [Tool] = [],
         toolChoice: Tool? = nil,
-        options: [String: Value] = [:]
+        options: [String: Value] = [:],
+        refusedDisabling: Bool = false
     ) -> Anthropic.ChatRequest {
         var req = Anthropic.ChatRequest(
             model: model.id,
@@ -35,7 +68,7 @@ public actor AnthropicService {
             tools: encode(tools)
         )
 
-        applyReasoning(to: &req, options: options, model: model)
+        applyReasoning(to: &req, options: options, model: model, alreadyRefusedDisabling: refusedDisabling)
         return req
     }
 
@@ -45,7 +78,7 @@ public actor AnthropicService {
     ///
     /// What each model accepts differs, and it refuses what it doesn't rather
     /// than ignoring it, so this asks first. See `Thinking`.
-    private func applyReasoning(to req: inout Anthropic.ChatRequest, options: [String: Value], model: Model) {
+    private func applyReasoning(to req: inout Anthropic.ChatRequest, options: [String: Value], model: Model, alreadyRefusedDisabling: Bool) {
         let supported = Thinking.supported(by: model)
 
         switch effort(from: options) {
@@ -53,7 +86,7 @@ public actor AnthropicService {
             break
 
         case .off:
-            if supported.canDisable {
+            if supported.canDisable && !alreadyRefusedDisabling {
                 req.thinking = .disabled
             } else {
                 // Some models reason on every request and reject being told
@@ -121,8 +154,13 @@ public actor AnthropicService {
         return nil
     }
 
-    func makeRequestForTesting(model: Model, options: [String: Value] = [:], messages: [Message] = []) -> Anthropic.ChatRequest {
-        makeRequest(model: model, messages: messages, options: options)
+    func makeRequestForTesting(
+        model: Model,
+        options: [String: Value] = [:],
+        messages: [Message] = [],
+        refusedDisabling: Bool = false
+    ) -> Anthropic.ChatRequest {
+        makeRequest(model: model, messages: messages, options: options, refusedDisabling: refusedDisabling)
     }
 
     /// The level to ask for, given what this model says it takes.
@@ -320,47 +358,112 @@ public actor AnthropicService {
 
 extension AnthropicService: ChatService {
 
+    /// Whether a failure was the service saying the request was wrong.
+    ///
+    /// A 400 and nothing else. Telling a model not to think is the only thing
+    /// in these requests that is assumed rather than reported, so a 400 while
+    /// doing it is very likely about that — and the other statuses are not:
+    /// 401 and 403 are the key, 429 is the rate, 5xx is theirs. Narrowing to
+    /// 400 is what makes this safe without reading the message, which would
+    /// mean matching prose that can be reworded at any time.
+    /// Exposed for a test: the statuses this does and doesn't act on are the
+    /// whole of why the retry is safe.
+    nonisolated func isBadRequestForTesting(_ error: Swift.Error) -> Bool {
+        isBadRequest(error)
+    }
+
+    nonisolated private func isBadRequest(_ error: Swift.Error) -> Bool {
+        guard case Anthropic.Client.Error.responseError(let response, _) = error else { return false }
+        return response.statusCode == 400
+    }
+
+    /// Retries a request that told a model not to think, asking for the least
+    /// instead, and remembers the model if that works.
+    ///
+    /// Recording only on the retry *succeeding* is what keeps this honest. If
+    /// the 400 was about something else — a malformed tool schema, say — the
+    /// retry fails the same way, nothing is remembered, and the original
+    /// error is what surfaces. So a wrong guess costs one request and
+    /// corrects itself, where a wrong guess written into the table stays
+    /// wrong.
+    private func retryingWithoutDisabling<T>(
+        model: Model,
+        wasDisabling: Bool,
+        _ attempt: (Bool) async throws -> T
+    ) async throws -> T {
+        do {
+            return try await attempt(false)
+        } catch {
+            guard wasDisabling, isBadRequest(error) else { throw error }
+            logger.info(
+                "\(model.id, privacy: .public) refused being told not to think; asking for the least instead"
+            )
+            let result = try await attempt(true)
+            await ThinkingRefusals.shared.remember(model.id)
+            return result
+        }
+    }
+
+    /// Whether this model has already refused, so the first request of a turn
+    /// asks the way that works rather than the way that failed last time.
+    private func hasRefusedDisabling(_ model: Model) async -> Bool {
+        await ThinkingRefusals.shared.refused(model.id)
+    }
+
     public func completion(_ request: ChatServiceRequest) async throws -> Message {
-        var req = makeRequest(
-            model: request.model,
-            messages: request.messages,
-            tools: request.tools,
-            options: request.options
-        )
-        req.temperature = temperature(from: request.options, model: request.model)
-        log(req, streaming: false)
-        let result = try await client.chatCompletions(req)
-        return decode(result)
+        let refused = await hasRefusedDisabling(request.model)
+        return try await retryingWithoutDisabling(model: request.model, wasDisabling: !refused) { giveUpDisabling in
+            var req = makeRequest(
+                model: request.model,
+                messages: request.messages,
+                tools: request.tools,
+                options: request.options,
+                refusedDisabling: refused || giveUpDisabling
+            )
+            req.temperature = temperature(from: request.options, model: request.model)
+            log(req, streaming: false)
+            let result = try await client.chatCompletions(req)
+            return decode(result)
+        }
     }
 
     public func completionStream(_ request: ChatServiceRequest, update: (Message) async throws -> Void) async throws {
-        var req = makeRequest(
-            model: request.model,
-            messages: request.messages,
-            tools: request.tools,
-            options: request.options
-        )
-        req.temperature = temperature(from: request.options, model: request.model)
-        req.stream = true
-        log(req, streaming: true)
+        let refused = await hasRefusedDisabling(request.model)
 
-        var message = Message(role: .assistant)
-        var seen: [String: Int] = [:]
-        do {
-            for try await result in try client.chatCompletionsStream(req) {
-                seen[result.type.rawValue, default: 0] += 1
-                patchMessage(&message, with: result)
-                try await update(message)
-            }
-        } catch {
-            logger.error(
-                "← anthropic stream failed after \(self.describe(seen), privacy: .public): \(error, privacy: .public)"
+        // The retry only ever happens before the first chunk arrives: a 400
+        // is the service rejecting the request, which it does instead of
+        // answering, so nothing has been handed to `update` yet and there is
+        // nothing to take back.
+        try await retryingWithoutDisabling(model: request.model, wasDisabling: !refused) { giveUpDisabling in
+            var req = makeRequest(
+                model: request.model,
+                messages: request.messages,
+                tools: request.tools,
+                options: request.options,
+                refusedDisabling: refused || giveUpDisabling
             )
-            throw error
+            req.temperature = temperature(from: request.options, model: request.model)
+            req.stream = true
+            log(req, streaming: true)
+
+            var message = Message(role: .assistant)
+            var seen: [String: Int] = [:]
+            do {
+                for try await result in try client.chatCompletionsStream(req) {
+                    seen[result.type.rawValue, default: 0] += 1
+                    patchMessage(&message, with: result)
+                    try await update(message)
+                }
+            } catch {
+                logger.error(
+                    "← anthropic stream failed after \(self.describe(seen), privacy: .public): \(error, privacy: .public)"
+                )
+                throw error
+            }
+            logger.info(
+                "← anthropic stream finished | \(self.describe(seen), privacy: .public) | \(Self.describe(usage: message), privacy: .public)"
+            )
         }
-        logger.info(
-            "← anthropic stream finished | \(self.describe(seen), privacy: .public) | \(Self.describe(usage: message), privacy: .public)"
-        )
     }
 
     /// What was asked for, in the terms the service was asked in.
