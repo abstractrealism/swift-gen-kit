@@ -213,6 +213,19 @@ extension Service {
     /// `.failed` where there is nothing to ask, so a caller treats it the
     /// same as a question that didn't get through and doesn't remember a
     /// non-answer.
+    /// Whether there is anything to ask this service.
+    ///
+    /// Worth knowing before asking rather than after: a caller that works
+    /// this out from a `.failed` can't tell "couldn't reach it" from "there
+    /// was never a question", so it would either forget a real failure or
+    /// ask Ollama about reasoning efforts on every load for ever.
+    public var canProbeReasoningLevels: Bool {
+        switch kind {
+        case .openAI, .deepseek, .grok, .groq, .mistral, .openRouter: true
+        default: false
+        }
+    }
+
     public func probeReasoningLevels(modelID: String, session: URLSession? = nil) async -> ReasoningProbe.Outcome {
         switch kind {
         case .openAI, .deepseek, .grok, .groq, .mistral, .openRouter:
